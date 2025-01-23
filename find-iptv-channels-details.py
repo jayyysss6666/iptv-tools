@@ -267,10 +267,12 @@ def main():
             )
             resolution = f"{stream_info.get('width', 'N/A')}x{stream_info.get('height', 'N/A')}" if args.check else "N/A"
             
-            if args.formatname: 
-                if resolution == "1280x720":
+            if args.formatname:
+                if "3280" in resolution:
+                    resolution = "UHD"
+                elif "720" in resolution:
                     resolution = "HD"
-                elif resolution == "1920x1080":
+                elif "1080" in resolution:
                     resolution = "FHD"
                 else:
                     resolution = "SD"
