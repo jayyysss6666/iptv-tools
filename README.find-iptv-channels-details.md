@@ -41,6 +41,8 @@ optional arguments:
   --debug              Enable debug mode.
   --epgcheck           Check if channels provide EPG data and count entries.
   --check              Check stream resolution and frame rate using ffprobe.
+  --formatname         Formats the name to include 4K, FHD, HD, SD for 3280, 1080, 720, <720 respectively.
+  --delay              Adds a 5s delay to prevent returning 456 err, resulting in no stream being tested.
   --save SAVE          Save the output to a CSV file. Provide the file name.
 ```
 
