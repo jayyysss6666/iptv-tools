@@ -277,11 +277,12 @@ def main():
             
             resolutionTag = None
             if args.formatname:
-                if "3840" in resolution:
+                _, splitResolution = resolution.split('x')
+                if "3840" in splitResolution:
                     resolutionTag = "UHD"
-                elif "720" in resolution:
+                elif "720" in splitResolution:
                     resolutionTag = "HD"
-                elif "1080" in resolution:
+                elif "1080" in splitResolution:
                     resolutionTag = "FHD"
                 else:
                     resolutionTag = "SD"
