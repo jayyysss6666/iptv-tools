@@ -200,7 +200,7 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Enable debug mode.")  # Debug flag
     parser.add_argument("--epgcheck", action="store_true", help="Check if channels provide EPG data and count entries.")
     parser.add_argument("--check", action="store_true", help="Check stream resolution and frame rate using ffprobe.")
-    parser.add_argument("--save", help="Save the output to a CSV file. Provide the file name.")
+    parser.add_argument("--save", action="store_true", help="Save the output to a CSV file.")
     parser.add_argument("--delay", action="store_true", help="Adds a 5s delay to prevent returning 456 err, resulting in no stream being tested.")
     parser.add_argument("--formatname", action="store_true", help="Formats the name to include 4K, FHD, HD, SD for 3280, 1080, 720, <720 respectively.")
     args = parser.parse_args()
@@ -235,10 +235,13 @@ def main():
     fieldnames = ["Stream ID", "Name", "Category", "Archive", "EPG", "Codec", "Resolution", "Frame Rate"]
 
     # Open CSV for live writing if --save is provided
-    csv_file = None
-    csv_writer = None
     if args.save:
-        csv_file = open(args.save, mode="w", newline='', encoding="utf-8")
+        csv_file = None
+        csv_writer = None
+        currentTime = datetime.now()
+        formattedTime = currentTime.strftime("%H_%M_%S")
+        fileName = args.category + "_" + formattedTime + ".csv"
+        csv_file = open(fileName, mode="w", newline='', encoding="utf-8")
         csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         csv_writer.writeheader()
 
@@ -256,7 +259,7 @@ def main():
             )
             
             if args.delay:
-                time.sleep(5)
+                t.sleep(5)
             
             # Generate stream URL
             stream_url = f"http://{args.server}/{args.user}/{args.pw}/{stream['stream_id']}"
@@ -267,18 +270,19 @@ def main():
             )
             resolution = f"{stream_info.get('width', 'N/A')}x{stream_info.get('height', 'N/A')}" if args.check else "N/A"
             
+            resolutionTag = None
             if args.formatname:
-                if "3280" in resolution:
-                    resolution = "UHD"
+                if "3840" in resolution:
+                    resolutionTag = "UHD"
                 elif "720" in resolution:
-                    resolution = "HD"
+                    resolutionTag = "HD"
                 elif "1080" in resolution:
-                    resolution = "FHD"
+                    resolutionTag = "FHD"
                 else:
-                    resolution = "SD"
+                    resolutionTag = "SD"
 
                 # Combine name and resolution with ' | ' separator
-                name_and_resolution = f"{stream['name'][:60]} | {resolution}"
+                name_and_resolution = f"{stream['name'][:60]} | {resolutionTag}"
             else:
                 name_and_resolution = f"{stream['name'][:60]}"
 
