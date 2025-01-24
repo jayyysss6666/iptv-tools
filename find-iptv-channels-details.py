@@ -200,7 +200,9 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Enable debug mode.")  # Debug flag
     parser.add_argument("--epgcheck", action="store_true", help="Check if channels provide EPG data and count entries.")
     parser.add_argument("--check", action="store_true", help="Check stream resolution and frame rate using ffprobe.")
-    parser.add_argument("--save", help="Save the output to a CSV file. Provide the file name.")
+    parser.add_argument("--save", action="store_true", help="Save the output to a CSV file.")
+    parser.add_argument("--delay", action="store_true", help="Adds a 5s delay to prevent returning 456 err, resulting in no stream being tested.")
+    parser.add_argument("--formatname", action="store_true", help="Formats the name to include 4K, FHD, HD, SD for 3280, 1080, 720, <720 respectively.")
     args = parser.parse_args()
 
     # Print the date and time when the program is run
@@ -210,7 +212,7 @@ def main():
 
     # Enable debug mode if the --debug flag is present
     DEBUG_MODE = args.debug
-    debug_log("Debug mode enabled")     # Will only print if debug mode is set.  else ignored
+    debug_log("Debug mode enabled")  # Will only print if debug mode is set, else ignored
 
     # Check ffprobe if --check is enabled
     if args.check:
@@ -229,46 +231,95 @@ def main():
     # Filter data
     filtered_streams = filter_data(live_categories, live_streams, args.category, args.channel)
 
-    # Prepare CSV data and headers
-    csv_data = []
+    # Prepare CSV headers
     fieldnames = ["Stream ID", "Name", "Category", "Archive", "EPG", "Codec", "Resolution", "Frame Rate"]
 
-    # Print and collect results
-    print(f"{'ID':<10}{'Name':<60} {'Category':<40}{'Archive':<8}{'EPG':<5}{'Codec':<8}{'Resolution':<15}{'Frame':<10}")
-    print("=" * 152)
-    category_map = {cat["category_id"]: cat["category_name"] for cat in live_categories}
-    for stream in filtered_streams:
-        category_name = category_map.get(stream["category_id"], "Unknown")
-        epg_count = (
-            check_epg(args.server, args.user, args.pw, stream["stream_id"]) if args.epgcheck else ""
-        )
-        # Generate stream URL
-        stream_url = f"http://{args.server}/{args.user}/{args.pw}/{stream['stream_id']}"
-        stream_info = (
-            check_channel(stream_url) if args.check else {"codec_name": "", "width": "", "height": "", "frame_rate": ""}
-        )
-        resolution = f"{stream_info.get('width', 'N/A')}x{stream_info.get('height', 'N/A')}" if args.check else "N/A" if args.check else ""
-        
-        # Print to console
-        print(f"{stream['stream_id']:<10}{stream['name'][:60]:<60} {category_name[:40]:<40}{stream.get('tv_archive_duration', 'N/A'):<8}{epg_count:<5}{stream_info.get('codec_name', 'N/A'):<8}{resolution:<15}{stream_info.get('frame_rate', 'N/A'):<10}")
-        
-        # Collect data for CSV
-        csv_data.append({
-            "Stream ID": stream["stream_id"],
-            "Name": stream['name'][:60],
-            "Category": category_name[:40],
-            "Archive": stream.get('tv_archive_duration', 'N/A'),
-            "EPG": epg_count,
-            "Codec": stream_info.get('codec_name', 'N/A'),
-            "Resolution": resolution,
-            "Frame Rate": stream_info.get('frame_rate', 'N/A'),
-        })
-
-    print(f"\n")
-    # Write to CSV if --save is provided
+    # Open CSV for live writing if --save is provided
     if args.save:
-        save_to_csv(args.save, csv_data, fieldnames)
-    print(f"\n\n")
+        csv_file = None
+        csv_writer = None
+        currentTime = datetime.now()
+        formattedTime = currentTime.strftime("%H_%M_%S")
+        if args.category is not None:
+            fileName = args.category + "_" + formattedTime + ".csv"
+        elif args.channel is not None:
+            fileName = args.channel + "_" + formattedTime + ".csv"
+        else:
+            fileName = "Full_" + formattedTime + ".csv"
+        csv_file = open(fileName, mode="w", newline='', encoding="utf-8")
+        csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        csv_writer.writeheader()
+
+    try:
+        # Print table headers
+        print(f"{'ID':<10}{'Name':<60} {'Category':<40}{'Archive':<8}{'EPG':<5}{'Codec':<8}{'Resolution':<15}{'Frame':<10}")
+        print("=" * 152)
+
+        # Create a category map
+        category_map = {cat["category_id"]: cat["category_name"] for cat in live_categories}
+        for stream in filtered_streams:
+            category_name = category_map.get(stream["category_id"], "Unknown")
+            epg_count = (
+                check_epg(args.server, args.user, args.pw, stream["stream_id"]) if args.epgcheck else ""
+            )
+            
+            if args.delay:
+                t.sleep(5)
+            
+            # Generate stream URL
+            stream_url = f"http://{args.server}/{args.user}/{args.pw}/{stream['stream_id']}"
+            stream_info = (
+                check_channel(stream_url)
+                if args.check
+                else {"codec_name": "", "width": "", "height": "", "frame_rate": ""}
+            )
+            resolution = f"{stream_info.get('width', 'N/A')}x{stream_info.get('height', 'N/A')}" if args.check else "N/A"
+            
+            resolutionTag = None
+            if args.formatname:
+                _, splitResolution = resolution.split('x')
+                if len(splitResolution) == 4 and splitResolution != "1080":
+                    resolutionTag = "UHD"
+                elif "720" in splitResolution:
+                    resolutionTag = "HD"
+                elif "1080" in splitResolution:
+                    resolutionTag = "FHD"
+                else:
+                    resolutionTag = "SD"
+
+                # Combine name and resolution with ' | ' separator
+                name_and_resolution = f"{stream['name'][:60]} | {resolutionTag}"
+            else:
+                name_and_resolution = f"{stream['name'][:60]}"
+
+            # Print to console
+            print(
+                f"{stream['stream_id']:<10}{name_and_resolution:<60} {category_name[:40]:<40}"
+                f"{stream.get('tv_archive_duration', 'N/A'):<8}{epg_count:<5}{stream_info.get('codec_name', 'N/A'):<8}"
+                f"{resolution:<15}{stream_info.get('frame_rate', 'N/A'):<10}"
+            )
+
+            # Write to CSV file live if enabled
+            if csv_writer:
+                csv_writer.writerow({
+                    "Stream ID": stream["stream_id"],
+                    "Name": name_and_resolution,
+                    "Category": category_name[:40],
+                    "Archive": stream.get("tv_archive_duration", "N/A"),
+                    "EPG": epg_count,
+                    "Codec": stream_info.get("codec_name", "N/A"),
+                    "Resolution": resolution,
+                    "Frame Rate": stream_info.get("frame_rate", "N/A"),
+                })
+
+    except KeyboardInterrupt:
+        print("\n\nProcess interrupted by user. Closing the CSV file safely...\n")
+    finally:
+        # Close the CSV file if opened
+        if csv_file:
+            csv_file.close()
+
+    print("\n\n")
 
 if __name__ == "__main__":
     main()
