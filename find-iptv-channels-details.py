@@ -240,10 +240,10 @@ def main():
         csv_writer = None
         currentTime = datetime.now()
         formattedTime = currentTime.strftime("%H_%M_%S")
-        if args.category not None:
+        if args.category is not None:
             fileName = args.category + "_" + formattedTime + ".csv"
-        elif args.channel not None:
-            filename = args.channel + "_" + formattedTime + ".csv"
+        elif args.channel is not None:
+            fileName = args.channel + "_" + formattedTime + ".csv"
         else:
             fileName = "Full_" + formattedTime + ".csv"
         csv_file = open(fileName, mode="w", newline='', encoding="utf-8")
