@@ -240,7 +240,12 @@ def main():
         csv_writer = None
         currentTime = datetime.now()
         formattedTime = currentTime.strftime("%H_%M_%S")
-        fileName = args.category + "_" + formattedTime + ".csv"
+        if args.category not None:
+            fileName = args.category + "_" + formattedTime + ".csv"
+        elif args.channel not None:
+            filename = args.channel + "_" + formattedTime + ".csv"
+        else:
+            fileName = "Full_" + formattedTime + ".csv"
         csv_file = open(fileName, mode="w", newline='', encoding="utf-8")
         csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         csv_writer.writeheader()
