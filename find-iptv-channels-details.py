@@ -133,12 +133,43 @@ def check_ffprobe():
         sys.exit(1)
 
 
-def check_channel(url):
+def check_streamlink():
+    """
+    Checks if the streamlink command is available on the system.
+    Returns True if available, False otherwise.
+    """
     try:
+        subprocess.run(
+            ["streamlink", "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=True,
+        )
+        debug_log("streamlink is installed and reachable.")
+        return True
+    except FileNotFoundError:
+        debug_log("streamlink is not installed or not found in the system PATH.")
+        return False
+    except subprocess.CalledProcessError as e:
+        debug_log(f"streamlink check failed with error: {e}")
+        return False
+
+
+def check_channel(url):
+    """
+    Check channel details using ffprobe, with streamlink fallback for complex streams.
+    Returns video codec, resolution, and frame rate information.
+    """
+    debug_log(f"Checking channel: {url}")
+
+    # First attempt: direct ffprobe
+    try:
+        debug_log("Attempting direct ffprobe analysis")
         result = subprocess.run(
             [
                 "ffprobe",
                 "-v", "error",
+                "-allowed_extensions", "ALL",
                 "-select_streams", "v:0",
                 "-show_entries", "stream=codec_name,width,height,avg_frame_rate",
                 "-of", "json",
@@ -146,7 +177,8 @@ def check_channel(url):
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            timeout=20  # Add timeout to prevent hanging
         )
 
         output = json.loads(result.stdout)
@@ -164,6 +196,7 @@ def check_channel(url):
             else:
                 frame_rate = avg_frame_rate
 
+            debug_log("Direct ffprobe analysis successful")
             return {
                 "status": "working",
                 "codec_name": codec_name,
@@ -171,12 +204,73 @@ def check_channel(url):
                 "height": height,
                 "frame_rate": frame_rate
             }
-        else:
-            debug_log(f"No streams found in ffprobe output for URL: {url}")
-            return {"status": "not working"}
-    except Exception as e:
-        debug_log(f"Error in check_channel: {e}")
-        return {"status": "error", "error_message": str(e)}
+        debug_log("Direct ffprobe found no streams")
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
+        debug_log(f"Direct ffprobe failed: {e}")
+
+    # Second attempt: streamlink fallback if available
+    if check_streamlink():
+        debug_log("Attempting streamlink fallback")
+        try:
+            # Start streamlink process to pipe stream to ffprobe
+            streamlink_process = subprocess.Popen(
+                ["streamlink", url, "best", "-O"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            # Feed streamlink's output to ffprobe via stdin
+            ffprobe_process = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v", "error",
+                    "-select_streams", "v:0",
+                    "-show_entries", "stream=codec_name,width,height,avg_frame_rate",
+                    "-of", "json",
+                    "-i", "pipe:0"  # Read from stdin
+                ],
+                stdin=streamlink_process.stdout,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=30
+            )
+
+            # Make sure to terminate the streamlink process
+            streamlink_process.terminate()
+
+            output = json.loads(ffprobe_process.stdout)
+
+            if 'streams' in output and len(output['streams']) > 0:
+                stream_info = output['streams'][0]
+                codec_name = stream_info.get('codec_name', 'Unknown')[:5]
+                width = stream_info.get('width', 'Unknown')
+                height = stream_info.get('height', 'Unknown')
+                avg_frame_rate = stream_info.get('avg_frame_rate', 'Unknown')
+
+                if avg_frame_rate != 'Unknown' and '/' in avg_frame_rate:
+                    num, denom = map(int, avg_frame_rate.split('/'))
+                    frame_rate = round(num / denom) if denom != 0 else "Unknown"
+                else:
+                    frame_rate = avg_frame_rate
+
+                debug_log("Streamlink fallback analysis successful")
+                return {
+                    "status": "working",
+                    "codec_name": codec_name,
+                    "width": width,
+                    "height": height,
+                    "frame_rate": frame_rate
+                }
+            debug_log("Streamlink fallback found no streams")
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception) as e:
+            debug_log(f"Streamlink fallback failed: {e}")
+    else:
+        debug_log("Streamlink not available for fallback")
+
+    # Both methods failed
+    debug_log("All stream analysis methods failed")
+    return {"status": "not working"}
 
 
 def save_to_csv(file_name, data, fieldnames):
