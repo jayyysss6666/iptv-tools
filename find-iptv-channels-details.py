@@ -6,16 +6,18 @@ import argparse
 import subprocess
 import signal
 import csv
-import time  # Added for sleep
+import time
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 CACHE_FILE_PATTERN = "cache-{server}-{data_type}.json"
 DEBUG_MODE = False  # Default: Debugging is off
 
+# Default maximum simultaneous stream-related operations
+DEFAULT_MAX_CONNECTIONS = 3
+
 def debug_log(message):
-    """
-    Logs a debug message if debugging is enabled.
-    """
+    """Logs a debug message if debugging is enabled."""
     if DEBUG_MODE:
         print(f"[DEBUG] {message}")
 
@@ -24,7 +26,6 @@ def load_cache(server, data_type):
     debug_log(f"Attempting to load cache for {data_type} on server {server}")
     cache_file = CACHE_FILE_PATTERN.format(server=server, data_type=data_type)
     if os.path.exists(cache_file):
-        # Check if the cache file was created today
         file_date = datetime.fromtimestamp(os.path.getmtime(cache_file)).date()
         if file_date == datetime.today().date():
             try:
@@ -54,29 +55,31 @@ def download_data(server, user, password, endpoint, additional_params=None):
     params = {"username": user, "password": password, "action": endpoint}
     if additional_params:
         params.update(additional_params)
-    response = requests.get(url, headers=headers, params=params)
+    response = requests.get(url, headers=headers, params=params, timeout=20)
     if response.status_code == 200:
-        debug_log(f"Response from server ({endpoint}): {response.text[:500]}")
-        return response.json()
+        debug_log(f"Response from server ({endpoint}): {response.text[:300]}")
+        try:
+            return response.json()
+        except json.JSONDecodeError:
+            print(f"Failed to parse JSON for {endpoint}", file=sys.stderr)
+            return {}
     else:
         print(f"Failed to fetch {endpoint} data: {response.status_code}", file=sys.stderr)
         sys.exit(1)
 
 def check_epg(server, user, password, stream_id):
-    """Check EPG data for a specific channel."""
+    """Check EPG data for a specific channel and return count."""
     debug_log(f"Checking EPG for stream ID {stream_id}")
     epg_data = download_data(server, user, password, "get_simple_data_table", {"stream_id": stream_id})
 
     if isinstance(epg_data, dict) and epg_data.get("epg_listings"):
-        return len(epg_data["epg_listings"])  # Return the count of EPG entries
-
+        return len(epg_data["epg_listings"])  # Count of EPG entries
     elif isinstance(epg_data, list):
-        debug_log(f"Unexpected list response for EPG data: {epg_data}")
-        return len(epg_data)  # Return the length of the list
-
+        debug_log(f"Unexpected list response for EPG data: {len(epg_data)} entries")
+        return len(epg_data)
     else:
         debug_log(f"Unexpected EPG response type: {type(epg_data)}")
-        return 0  # No EPG data available
+        return 0
 
 def filter_data(live_categories, live_streams, group, channel):
     """Filter the live streams based on group and channel arguments."""
@@ -113,6 +116,7 @@ def check_ffprobe():
         sys.exit(1)
 
 def check_channel(url):
+    """Run ffprobe on a stream URL and return basic info."""
     try:
         result = subprocess.run(
             [
@@ -125,21 +129,25 @@ def check_channel(url):
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            text=True,
+            timeout=15
         )
 
-        output = json.loads(result.stdout)
+        output = json.loads(result.stdout) if result.stdout else {}
 
         if 'streams' in output and len(output['streams']) > 0:
             stream_info = output['streams'][0]
-            codec_name = stream_info.get('codec_name', 'Unknown')[:5]
+            codec_name = stream_info.get('codec_name', 'Unknown')[:8]
             width = stream_info.get('width', 'Unknown')
             height = stream_info.get('height', 'Unknown')
             avg_frame_rate = stream_info.get('avg_frame_rate', 'Unknown')
 
             if avg_frame_rate != 'Unknown' and '/' in avg_frame_rate:
-                num, denom = map(int, avg_frame_rate.split('/'))
-                frame_rate = round(num / denom) if denom != 0 else "Unknown"
+                try:
+                    num, denom = map(int, avg_frame_rate.split('/'))
+                    frame_rate = round(num / denom) if denom != 0 else "Unknown"
+                except Exception:
+                    frame_rate = avg_frame_rate
             else:
                 frame_rate = avg_frame_rate
 
@@ -153,6 +161,8 @@ def check_channel(url):
         else:
             debug_log(f"No streams found in ffprobe output for URL: {url}")
             return {"status": "not working"}
+    except subprocess.TimeoutExpired:
+        return {"status": "timeout"}
     except Exception as e:
         debug_log(f"Error in check_channel: {e}")
         return {"status": "error", "error_message": str(e)}
@@ -168,10 +178,36 @@ def save_to_csv(file_name, data, fieldnames):
     except Exception as e:
         print(f"Error saving to CSV: {e}")
 
-def handle_sigint(signal, frame):
+def handle_sigint(signal_received, frame):
     """Handle Ctrl+C gracefully."""
     print("\nProgram interrupted by user. Exiting...")
     sys.exit(0)
+
+def process_stream(stream, args, category_map):
+    """Perform (optional) EPG and ffprobe checks for a single stream."""
+    category_name = category_map.get(stream["category_id"], "Unknown")
+    epg_count = ""
+    if args.epgcheck:
+        epg_count = check_epg(args.server, args.user, args.pw, stream["stream_id"])
+
+    stream_info = {"codec_name": "", "width": "", "height": "", "frame_rate": ""}
+    if args.check:
+        stream_url = f"http://{args.server}/{args.user}/{args.pw}/{stream['stream_id']}"
+        stream_info = check_channel(stream_url)
+
+    resolution = ""
+    if args.check:
+        width = stream_info.get('width', 'N/A')
+        height = stream_info.get('height', 'N/A')
+        resolution = f"{width}x{height}" if width != 'Unknown' and height != 'Unknown' else "N/A"
+
+    return {
+        "stream": stream,
+        "category_name": category_name,
+        "epg_count": epg_count,
+        "stream_info": stream_info,
+        "resolution": resolution
+    }
 
 def main():
     global DEBUG_MODE
@@ -189,6 +225,8 @@ def main():
     parser.add_argument("--epgcheck", action="store_true", help="Check if channels provide EPG data and count entries.")
     parser.add_argument("--check", action="store_true", help="Check stream resolution and frame rate using ffprobe.")
     parser.add_argument("--save", help="Save the output to a CSV file. Provide the file name.")
+    parser.add_argument("--max-connections", type=int, default=DEFAULT_MAX_CONNECTIONS, help="Maximum simultaneous EPG/ffprobe operations (default 3).")
+    parser.add_argument("--ordered", action="store_true", help="Preserve original ordering in output (slower if many streams).")
     args = parser.parse_args()
 
     masked_server = f"{'.'.join(['xxxxx'] + args.server.split('.')[1:])}"
@@ -215,26 +253,41 @@ def main():
     csv_data = []
     fieldnames = ["Stream ID", "Name", "Category", "Archive", "EPG", "Codec", "Resolution", "Frame Rate"]
 
-    print(f"{'ID':<10}{'Name':<60} {'Category':<40}{'Archive':<8}{'EPG':<5}{'Codec':<8}{'Resolution':<15}{'Frame':<10}")
-    print("=" * 152)
+    print(f"{'ID':<10}{'Name':<60} {'Category':<40}{'Archive':<8}{'EPG':<5}{'Codec':<10}{'Resolution':<15}{'Frame':<10}{'Status':<10}")
+    print("=" * 168)
     category_map = {cat["category_id"]: cat["category_name"] for cat in live_categories}
-    for stream in filtered_streams:
-        category_name = category_map.get(stream["category_id"], "Unknown")
-        epg_count = ""
-        if args.epgcheck:
-            epg_count = check_epg(args.server, args.user, args.pw, stream["stream_id"])
-            time.sleep(2)  # 2-second pause after EPG check
 
-        stream_url = f"http://{args.server}/{args.user}/{args.pw}/{stream['stream_id']}"
-        stream_info = (
-            check_channel(stream_url) if args.check else {"codec_name": "", "width": "", "height": "", "frame_rate": ""}
-        )
-        if args.check:
-            time.sleep(2)  # 2-second pause after ffprobe/stream check
+    # Concurrency control: process streams with a thread pool limiting simultaneous operations
+    results = []
+    if args.max_connections < 1:
+        args.max_connections = 1
 
-        resolution = f"{stream_info.get('width', 'N/A')}x{stream_info.get('height', 'N/A')}" if args.check else "N/A" if args.check else ""
+    debug_log(f"Processing {len(filtered_streams)} streams with max {args.max_connections} concurrent operations")
 
-        print(f"{stream['stream_id']:<10}{stream['name'][:60]:<60} {category_name[:40]:<40}{stream.get('tv_archive_duration', 'N/A'):<8}{epg_count:<5}{stream_info.get('codec_name', 'N/A'):<8}{resolution:<15}{stream_info.get('frame_rate', 'N/A'):<10}")
+    with ThreadPoolExecutor(max_workers=args.max_connections) as executor:
+        futures = []
+        for stream in filtered_streams:
+            futures.append(executor.submit(process_stream, stream, args, category_map))
+
+        if args.ordered:
+            # Preserve submission order
+            for fut in futures:
+                results.append(fut.result())
+        else:
+            # As they complete (faster feedback); order may differ
+            from concurrent.futures import as_completed
+            for fut in as_completed(futures):
+                results.append(fut.result())
+
+    # Output
+    for result in results:
+        stream = result["stream"]
+        category_name = result["category_name"]
+        epg_count = result["epg_count"]
+        stream_info = result["stream_info"]
+        resolution = result["resolution"]
+
+        print(f"{stream['stream_id']:<10}{stream['name'][:60]:<60} {category_name[:40]:<40}{stream.get('tv_archive_duration', 'N/A'):<8}{str(epg_count):<5}{stream_info.get('codec_name', ''):<10}{resolution:<15}{str(stream_info.get('frame_rate', '')):<10}{stream_info.get('status', ''):<10}")
 
         csv_data.append({
             "Stream ID": stream["stream_id"],
@@ -242,15 +295,15 @@ def main():
             "Category": category_name[:40],
             "Archive": stream.get('tv_archive_duration', 'N/A'),
             "EPG": epg_count,
-            "Codec": stream_info.get('codec_name', 'N/A'),
+            "Codec": stream_info.get('codec_name', ''),
             "Resolution": resolution,
-            "Frame Rate": stream_info.get('frame_rate', 'N/A'),
+            "Frame Rate": stream_info.get('frame_rate', ''),
         })
 
-    print(f"\n")
+    print("\n")
     if args.save:
         save_to_csv(args.save, csv_data, fieldnames)
-    print(f"\n\n")
+    print("\n\n")
 
 if __name__ == "__main__":
     main()
