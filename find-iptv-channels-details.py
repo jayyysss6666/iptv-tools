@@ -6,6 +6,7 @@ import argparse
 import subprocess
 import signal
 import csv
+import time  # Added for sleep
 from datetime import datetime
 
 CACHE_FILE_PATTERN = "cache-{server}-{data_type}.json"
@@ -27,7 +28,7 @@ def load_cache(server, data_type):
         file_date = datetime.fromtimestamp(os.path.getmtime(cache_file)).date()
         if file_date == datetime.today().date():
             try:
-                with open(cache_file, 'r') as file:
+                with open(cache_file, ' 'r') as file:
                     return json.load(file)
             except (OSError, IOError, json.JSONDecodeError) as e:
                 print(f"Error reading cache file {cache_file}: {e}", file=sys.stderr)
@@ -55,7 +56,7 @@ def download_data(server, user, password, endpoint, additional_params=None):
         params.update(additional_params)
     response = requests.get(url, headers=headers, params=params)
     if response.status_code == 200:
-        debug_log(f"Response from server ({endpoint}): {response.text[:500]}")  # Print first 500 characters
+        debug_log(f"Response from server ({endpoint}): {response.text[:500]}")
         return response.json()
     else:
         print(f"Failed to fetch {endpoint} data: {response.status_code}", file=sys.stderr)
@@ -84,24 +85,18 @@ def filter_data(live_categories, live_streams, group, channel):
     channel = channel.lower() if channel else None
 
     for stream in live_streams:
-        # Filter by group if specified
         if group:
             matching_categories = [cat for cat in live_categories if group in cat["category_name"].lower()]
             if not any(cat["category_id"] == stream["category_id"] for cat in matching_categories):
                 continue
-        # Filter by channel if specified
         if channel and channel not in stream["name"].lower():
             continue
-        # Add the stream to the filtered list
         filtered_streams.append(stream)
 
     return filtered_streams
 
 def check_ffprobe():
-    """
-    Checks if the ffprobe command is available on the system.
-    Exits the program with an error message if not found.
-    """
+    """Checks if the ffprobe command is available on the system."""
     try:
         subprocess.run(
             ["ffprobe", "-version"],
@@ -163,13 +158,7 @@ def check_channel(url):
         return {"status": "error", "error_message": str(e)}
 
 def save_to_csv(file_name, data, fieldnames):
-    """
-    Save data to a CSV file, ensuring all fields are enclosed in double quotes.
-    
-    :param file_name: The name of the CSV file to save.
-    :param data: A list of dictionaries containing the data to write.
-    :param fieldnames: A list of field names for the CSV header.
-    """
+    """Save data to a CSV file, ensuring all fields are enclosed in double quotes."""
     try:
         with open(file_name, "w", newline="", encoding="utf-8") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
@@ -187,7 +176,6 @@ def handle_sigint(signal, frame):
 def main():
     global DEBUG_MODE
 
-    # Set up the signal handler for Ctrl+C
     signal.signal(signal.SIGINT, handle_sigint)
 
     parser = argparse.ArgumentParser(description="Xtream IPTV Downloader and Filter")
@@ -197,26 +185,22 @@ def main():
     parser.add_argument("--nocache", action="store_true", help="Force download and ignore cache.")
     parser.add_argument("--channel", help="Filter by channel name.")
     parser.add_argument("--category", help="Filter by category name.")
-    parser.add_argument("--debug", action="store_true", help="Enable debug mode.")  # Debug flag
+    parser.add_argument("--debug", action="store_true", help="Enable debug mode.")
     parser.add_argument("--epgcheck", action="store_true", help="Check if channels provide EPG data and count entries.")
     parser.add_argument("--check", action="store_true", help="Check stream resolution and frame rate using ffprobe.")
     parser.add_argument("--save", help="Save the output to a CSV file. Provide the file name.")
     args = parser.parse_args()
 
-    # Print the date and time when the program is run
     masked_server = f"{'.'.join(['xxxxx'] + args.server.split('.')[1:])}"
     run_time = datetime.now().strftime("%Y-%m-%d %H:%M")
     print(f"\n\nfind-iptv-channels-details - Running for server {masked_server} on {run_time}\n")
 
-    # Enable debug mode if the --debug flag is present
     DEBUG_MODE = args.debug
-    debug_log("Debug mode enabled")     # Will only print if debug mode is set.  else ignored
+    debug_log("Debug mode enabled")
 
-    # Check ffprobe if --check is enabled
     if args.check:
         check_ffprobe()
 
-    # Check cache or download data
     live_categories = load_cache(args.server, "live_categories") if not args.nocache else None
     live_streams = load_cache(args.server, "live_streams") if not args.nocache else None
 
@@ -226,33 +210,32 @@ def main():
         save_cache(args.server, "live_categories", live_categories)
         save_cache(args.server, "live_streams", live_streams)
 
-    # Filter data
     filtered_streams = filter_data(live_categories, live_streams, args.category, args.channel)
 
-    # Prepare CSV data and headers
     csv_data = []
     fieldnames = ["Stream ID", "Name", "Category", "Archive", "EPG", "Codec", "Resolution", "Frame Rate"]
 
-    # Print and collect results
     print(f"{'ID':<10}{'Name':<60} {'Category':<40}{'Archive':<8}{'EPG':<5}{'Codec':<8}{'Resolution':<15}{'Frame':<10}")
     print("=" * 152)
     category_map = {cat["category_id"]: cat["category_name"] for cat in live_categories}
     for stream in filtered_streams:
         category_name = category_map.get(stream["category_id"], "Unknown")
-        epg_count = (
-            check_epg(args.server, args.user, args.pw, stream["stream_id"]) if args.epgcheck else ""
-        )
-        # Generate stream URL
+        epg_count = ""
+        if args.epgcheck:
+            epg_count = check_epg(args.server, args.user, args.pw, stream["stream_id"])
+            time.sleep(1)  # 1-second pause after EPG check
+
         stream_url = f"http://{args.server}/{args.user}/{args.pw}/{stream['stream_id']}"
         stream_info = (
             check_channel(stream_url) if args.check else {"codec_name": "", "width": "", "height": "", "frame_rate": ""}
         )
+        if args.check:
+            time.sleep(1)  # 1-second pause after ffprobe/stream check
+
         resolution = f"{stream_info.get('width', 'N/A')}x{stream_info.get('height', 'N/A')}" if args.check else "N/A" if args.check else ""
-        
-        # Print to console
+
         print(f"{stream['stream_id']:<10}{stream['name'][:60]:<60} {category_name[:40]:<40}{stream.get('tv_archive_duration', 'N/A'):<8}{epg_count:<5}{stream_info.get('codec_name', 'N/A'):<8}{resolution:<15}{stream_info.get('frame_rate', 'N/A'):<10}")
-        
-        # Collect data for CSV
+
         csv_data.append({
             "Stream ID": stream["stream_id"],
             "Name": stream['name'][:60],
@@ -265,7 +248,6 @@ def main():
         })
 
     print(f"\n")
-    # Write to CSV if --save is provided
     if args.save:
         save_to_csv(args.save, csv_data, fieldnames)
     print(f"\n\n")
