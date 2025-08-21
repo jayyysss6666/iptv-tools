@@ -223,14 +223,14 @@ def main():
         epg_count = ""
         if args.epgcheck:
             epg_count = check_epg(args.server, args.user, args.pw, stream["stream_id"])
-            time.sleep(2)  # 2-second pause after EPG check
+            time.sleep(3)  # 3-second pause after EPG check
 
         stream_url = f"http://{args.server}/{args.user}/{args.pw}/{stream['stream_id']}"
         stream_info = (
             check_channel(stream_url) if args.check else {"codec_name": "", "width": "", "height": "", "frame_rate": ""}
         )
         if args.check:
-            time.sleep(2)  # 2-second pause after ffprobe/stream check
+            time.sleep(3)  # 3-second pause after ffprobe/stream check
 
         resolution = f"{stream_info.get('width', 'N/A')}x{stream_info.get('height', 'N/A')}" if args.check else "N/A" if args.check else ""
 
