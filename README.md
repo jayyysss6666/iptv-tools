@@ -22,7 +22,7 @@ python3 —version
 2. Clone the repository using the following command:
 
 ```bash
-git clone https://github.com/estrellagus/iptv-tools
+git clone https://github.com/jayyysss6666/iptv-tools
 cd iptv-tools
 ```
 
