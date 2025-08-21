@@ -8,13 +8,17 @@ import signal
 import csv
 import time
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 CACHE_FILE_PATTERN = "cache-{server}-{data_type}.json"
 DEBUG_MODE = False  # Default: Debugging is off
 
 # Default maximum simultaneous stream-related operations
 DEFAULT_MAX_CONNECTIONS = 3
+
+# Global lock for printing so lines don't interleave
+PRINT_LOCK = threading.Lock()
 
 def debug_log(message):
     """Logs a debug message if debugging is enabled."""
@@ -183,31 +187,43 @@ def handle_sigint(signal_received, frame):
     print("\nProgram interrupted by user. Exiting...")
     sys.exit(0)
 
-def process_stream(stream, args, category_map):
-    """Perform (optional) EPG and ffprobe checks for a single stream."""
-    category_name = category_map.get(stream["category_id"], "Unknown")
-    epg_count = ""
-    if args.epgcheck:
-        epg_count = check_epg(args.server, args.user, args.pw, stream["stream_id"])
+def process_stream(stream, args, category_map, semaphore):
+    """Perform (optional) EPG and ffprobe checks for a single stream.
 
-    stream_info = {"codec_name": "", "width": "", "height": "", "frame_rate": ""}
-    if args.check:
-        stream_url = f"http://{args.server}/{args.user}/{args.pw}/{stream['stream_id']}"
-        stream_info = check_channel(stream_url)
+    A semaphore is used in addition to the thread pool to enforce the maximum
+    number of simultaneous network/ffprobe operations. (Redundant with pool size
+    but explicit for safety if future parallelism is added.)
+    """
+    with semaphore:
+        category_name = category_map.get(stream["category_id"], "Unknown")
+        epg_count = ""
+        if args.epgcheck:
+            epg_count = check_epg(args.server, args.user, args.pw, stream["stream_id"])
 
-    resolution = ""
-    if args.check:
-        width = stream_info.get('width', 'N/A')
-        height = stream_info.get('height', 'N/A')
-        resolution = f"{width}x{height}" if width != 'Unknown' and height != 'Unknown' else "N/A"
+        stream_info = {"codec_name": "", "width": "", "height": "", "frame_rate": "", "status": ""}
+        if args.check:
+            stream_url = f"http://{args.server}/{args.user}/{args.pw}/{stream['stream_id']}"
+            stream_info = check_channel(stream_url)
 
-    return {
-        "stream": stream,
-        "category_name": category_name,
-        "epg_count": epg_count,
-        "stream_info": stream_info,
-        "resolution": resolution
-    }
+        resolution = ""
+        if args.check:
+            width = stream_info.get('width', 'N/A')
+            height = stream_info.get('height', 'N/A')
+            resolution = f"{width}x{height}" if width != 'Unknown' and height != 'Unknown' else "N/A"
+
+        return {
+            "stream": stream,
+            "category_name": category_name,
+            "epg_count": epg_count,
+            "stream_info": stream_info,
+            "resolution": resolution
+        }
+
+def print_stream_line(stream, category_name, epg_count, stream_info, resolution):
+    status = stream_info.get('status', '')
+    line = f"{stream['stream_id']:<10}{stream['name'][:60]:<60} {category_name[:40]:<40}{stream.get('tv_archive_duration', 'N/A'):<8}{str(epg_count):<5}{stream_info.get('codec_name', ''):<10}{resolution:<15}{str(stream_info.get('frame_rate', '')):<10}{status:<10}"
+    with PRINT_LOCK:
+        print(line, flush=True)
 
 def main():
     global DEBUG_MODE
@@ -254,51 +270,61 @@ def main():
     fieldnames = ["Stream ID", "Name", "Category", "Archive", "EPG", "Codec", "Resolution", "Frame Rate"]
 
     print(f"{'ID':<10}{'Name':<60} {'Category':<40}{'Archive':<8}{'EPG':<5}{'Codec':<10}{'Resolution':<15}{'Frame':<10}{'Status':<10}")
-    print("=" * 168)
+    print("=" * 168, flush=True)
     category_map = {cat["category_id"]: cat["category_name"] for cat in live_categories}
 
     # Concurrency control: process streams with a thread pool limiting simultaneous operations
-    results = []
     if args.max_connections < 1:
         args.max_connections = 1
 
     debug_log(f"Processing {len(filtered_streams)} streams with max {args.max_connections} concurrent operations")
 
+    semaphore = threading.Semaphore(args.max_connections)
+
+    # Submit tasks
     with ThreadPoolExecutor(max_workers=args.max_connections) as executor:
-        futures = []
-        for stream in filtered_streams:
-            futures.append(executor.submit(process_stream, stream, args, category_map))
+        futures = [executor.submit(process_stream, stream, args, category_map, semaphore) for stream in filtered_streams]
 
         if args.ordered:
-            # Preserve submission order
+            # Preserve order: iterate futures list in submission order
             for fut in futures:
-                results.append(fut.result())
+                result = fut.result()
+                stream = result["stream"]
+                category_name = result["category_name"]
+                epg_count = result["epg_count"]
+                stream_info = result["stream_info"]
+                resolution = result["resolution"]
+                print_stream_line(stream, category_name, epg_count, stream_info, resolution)
+                csv_data.append({
+                    "Stream ID": stream["stream_id"],
+                    "Name": stream['name'][:60],
+                    "Category": category_name[:40],
+                    "Archive": stream.get('tv_archive_duration', 'N/A'),
+                    "EPG": epg_count,
+                    "Codec": stream_info.get('codec_name', ''),
+                    "Resolution": resolution,
+                    "Frame Rate": stream_info.get('frame_rate', ''),
+                })
         else:
-            # As they complete (faster feedback); order may differ
-            from concurrent.futures import as_completed
+            # Print as tasks complete for immediate feedback
             for fut in as_completed(futures):
-                results.append(fut.result())
-
-    # Output
-    for result in results:
-        stream = result["stream"]
-        category_name = result["category_name"]
-        epg_count = result["epg_count"]
-        stream_info = result["stream_info"]
-        resolution = result["resolution"]
-
-        print(f"{stream['stream_id']:<10}{stream['name'][:60]:<60} {category_name[:40]:<40}{stream.get('tv_archive_duration', 'N/A'):<8}{str(epg_count):<5}{stream_info.get('codec_name', ''):<10}{resolution:<15}{str(stream_info.get('frame_rate', '')):<10}{stream_info.get('status', ''):<10}")
-
-        csv_data.append({
-            "Stream ID": stream["stream_id"],
-            "Name": stream['name'][:60],
-            "Category": category_name[:40],
-            "Archive": stream.get('tv_archive_duration', 'N/A'),
-            "EPG": epg_count,
-            "Codec": stream_info.get('codec_name', ''),
-            "Resolution": resolution,
-            "Frame Rate": stream_info.get('frame_rate', ''),
-        })
+                result = fut.result()
+                stream = result["stream"]
+                category_name = result["category_name"]
+                epg_count = result["epg_count"]
+                stream_info = result["stream_info"]
+                resolution = result["resolution"]
+                print_stream_line(stream, category_name, epg_count, stream_info, resolution)
+                csv_data.append({
+                    "Stream ID": stream["stream_id"],
+                    "Name": stream['name'][:60],
+                    "Category": category_name[:40],
+                    "Archive": stream.get('tv_archive_duration', 'N/A'),
+                    "EPG": epg_count,
+                    "Codec": stream_info.get('codec_name', ''),
+                    "Resolution": resolution,
+                    "Frame Rate": stream_info.get('frame_rate', ''),
+                })
 
     print("\n")
     if args.save:
