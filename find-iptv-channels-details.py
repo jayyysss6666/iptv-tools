@@ -28,7 +28,7 @@ def load_cache(server, data_type):
         file_date = datetime.fromtimestamp(os.path.getmtime(cache_file)).date()
         if file_date == datetime.today().date():
             try:
-                with open(cache_file, ' 'r') as file:
+                with open(cache_file, 'r') as file:
                     return json.load(file)
             except (OSError, IOError, json.JSONDecodeError) as e:
                 print(f"Error reading cache file {cache_file}: {e}", file=sys.stderr)
