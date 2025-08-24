@@ -8,6 +8,8 @@ import sys
 import time
 from datetime import datetime
 import concurrent.futures
+import re
+from urllib.parse import urlparse
 
 def calculate_stability_score(metrics):
     """
@@ -154,6 +156,57 @@ def check_connection(url, timeout=5):
             'error': str(e)
         }
 
+def validate_server_url(server):
+    """
+    Validate and format the server URL properly.
+    
+    Args:
+        server (str): Server hostname or URL
+        
+    Returns:
+        str: Formatted server URL without trailing slash
+    """
+    # If server doesn't start with http:// or https://, add http://
+    if not server.startswith(('http://', 'https://')):
+        server = f"http://{server}"
+    
+    # Remove trailing slash if present
+    server = server.rstrip('/')
+    
+    # Validate URL format
+    try:
+        result = urlparse(server)
+        if not all([result.scheme, result.netloc]):
+            raise ValueError("Invalid URL format")
+        return server
+    except Exception as e:
+        raise ValueError(f"Invalid server URL: {e}")
+
+def verify_server_connection(server):
+    """
+    Verify basic connectivity to the server.
+    
+    Args:
+        server (str): Server URL
+        
+    Returns:
+        bool: True if connection successful, False otherwise
+    """
+    try:
+        response = requests.head(server, timeout=10)
+        return response.status_code < 500  # Consider any non-server error as "reachable"
+    except requests.RequestException:
+        # If HTTP fails, try HTTPS
+        if server.startswith('http://'):
+            try:
+                https_server = f"https://{server[7:]}"
+                response = requests.head(https_server, timeout=10)
+                print(f"HTTP failed, but HTTPS works. Consider using: {https_server}")
+                return True
+            except requests.RequestException:
+                return False
+        return False
+
 def get_channel_list(server, username, password, cache_file=None, use_cache=True):
     """
     Get the list of channels from an Xtream API server.
@@ -178,9 +231,34 @@ def get_channel_list(server, username, password, cache_file=None, use_cache=True
         except Exception as e:
             print(f"Cache error: {e}")
     
+    # Format and validate the server URL
+    try:
+        server = validate_server_url(server)
+    except ValueError as e:
+        print(f"Error: {e}")
+        return []
+        
+    # Verify basic server connectivity
+    print(f"Verifying connection to {server}...")
+    if not verify_server_connection(server):
+        print(f"Error: Cannot connect to server {server}")
+        # Try with HTTPS if HTTP was used
+        if server.startswith('http://'):
+            https_server = f"https://{server[7:]}"
+            print(f"Trying HTTPS: {https_server}")
+            if verify_server_connection(https_server):
+                server = https_server
+                print(f"HTTPS connection successful, using {server}")
+            else:
+                print(f"Error: Cannot connect to server with HTTPS either")
+                return []
+        else:
+            return []
+    
     # If no cache or cache disabled, fetch from server
     try:
-        base_url = f"http://{server}/player_api.php"
+        # Try standard Xtream API endpoint
+        api_endpoint = f"{server}/player_api.php"
         params = {
             'username': username,
             'password': password,
@@ -188,21 +266,72 @@ def get_channel_list(server, username, password, cache_file=None, use_cache=True
         }
         
         print(f"Fetching channels from {server}...")
-        response = requests.get(base_url, params=params, timeout=30)
-        response.raise_for_status()
+        response = requests.get(api_endpoint, params=params, timeout=30)
         
-        channels = response.json()
-        print(f"Retrieved {len(channels)} channels.")
+        # Check if response seems valid
+        if response.status_code == 200:
+            try:
+                channels = response.json()
+                if isinstance(channels, list) and len(channels) > 0:
+                    print(f"Retrieved {len(channels)} channels.")
+                    
+                    # Save to cache if specified
+                    if cache_file:
+                        with open(cache_file, 'w', encoding='utf-8') as f:
+                            json.dump(channels, f, ensure_ascii=False, indent=2)
+                        print(f"Saved channels to cache: {cache_file}")
+                    
+                    return channels
+                else:
+                    print(f"Warning: Received valid JSON but no channels were found.")
+            except json.JSONDecodeError:
+                print("Error: Received invalid JSON response")
+                print(f"Response preview: {response.text[:200]}...")
+        else:
+            print(f"Error: Server returned status code {response.status_code}")
         
-        # Save to cache if specified
-        if cache_file:
-            with open(cache_file, 'w', encoding='utf-8') as f:
-                json.dump(channels, f, ensure_ascii=False, indent=2)
-            print(f"Saved channels to cache: {cache_file}")
+        # If standard endpoint failed, try alternative endpoints
+        alt_endpoints = [
+            f"{server}/api/panel_api.php",
+            f"{server}/panel_api.php"
+        ]
         
-        return channels
-    except Exception as e:
+        for endpoint in alt_endpoints:
+            print(f"Trying alternative API endpoint: {endpoint}")
+            try:
+                response = requests.get(endpoint, params=params, timeout=30)
+                if response.status_code == 200:
+                    try:
+                        data = response.json()
+                        # Different API endpoints might return different structures
+                        channels = []
+                        if 'available_channels' in data:
+                            channels = data['available_channels']
+                        elif 'categories' in data:
+                            # Some APIs nest channels under categories
+                            for category in data['categories'].values():
+                                if 'channels' in category:
+                                    channels.extend(category['channels'])
+                        
+                        if channels:
+                            print(f"Retrieved {len(channels)} channels using alternative API.")
+                            return channels
+                    except json.JSONDecodeError:
+                        pass
+            except requests.RequestException:
+                pass
+        
+        print("Error: Could not fetch channels from any API endpoint")
+        return []
+        
+    except requests.RequestException as e:
         print(f"Error fetching channels: {e}")
+        return []
+    except json.JSONDecodeError as e:
+        print(f"Error parsing JSON response: {e}")
+        return []
+    except Exception as e:
+        print(f"Unexpected error fetching channels: {e}")
         return []
 
 def filter_channels_by_category(channels, category):
@@ -239,7 +368,9 @@ def get_stream_url(server, username, password, stream_id, stream_type='live'):
     Returns:
         str: Full stream URL
     """
-    return f"http://{server}/{stream_type}/{username}/{password}/{stream_id}"
+    # Ensure server URL is formatted correctly
+    server = validate_server_url(server)
+    return f"{server}/{stream_type}/{username}/{password}/{stream_id}"
 
 def save_to_csv(channels, filename):
     """
@@ -277,7 +408,7 @@ def main():
     parser = argparse.ArgumentParser(description='Find and analyze IPTV channels')
     
     # Server connection parameters
-    parser.add_argument('--server', required=True, help='Xtream server address')
+    parser.add_argument('--server', required=True, help='Xtream server address (with or without http:// or https://)')
     parser.add_argument('--user', required=True, help='Xtream username')
     parser.add_argument('--pw', required=True, help='Xtream password')
     
@@ -296,7 +427,18 @@ def main():
     # Output options
     parser.add_argument('--save', help='Save results to CSV file')
     
+    # Additional options
+    parser.add_argument('--force-https', action='store_true', help='Force using HTTPS instead of HTTP')
+    parser.add_argument('--list-categories', action='store_true', help='List all available categories')
+    
     args = parser.parse_args()
+    
+    # Apply HTTPS if requested
+    if args.force_https and not args.server.startswith('https://'):
+        if args.server.startswith('http://'):
+            args.server = f"https://{args.server[7:]}"
+        else:
+            args.server = f"https://{args.server}"
     
     # Get all channels
     cache_file = args.cachefile if not args.nocache else None
@@ -310,6 +452,18 @@ def main():
     
     if not all_channels:
         print("No channels found. Exiting.")
+        return
+    
+    # List categories if requested
+    if args.list_categories:
+        categories = {}
+        for channel in all_channels:
+            category = channel.get('category_name', 'Unknown')
+            categories[category] = categories.get(category, 0) + 1
+        
+        print("\nAvailable Categories:")
+        for cat, count in sorted(categories.items()):
+            print(f"  {cat}: {count} channels")
         return
     
     # Apply category filter if specified
