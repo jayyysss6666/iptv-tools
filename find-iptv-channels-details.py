@@ -151,13 +151,13 @@ def check_channel(url, stream_id):
     
     debug_log(f"Checking stream {stream_id} with URL: {url}")
     
-    start_time = time.time()
     try:
         result = subprocess.run(
             [
                 "ffprobe",
                 "-v", "error",
-                "-show_entries", "stream=codec_type,codec_name,width,height,avg_frame_rate,bit_rate",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name,width,height,avg_frame_rate",
                 "-of", "json",
                 "-timeout", "10000000",  # 10 seconds timeout in microseconds
                 url
@@ -167,50 +167,38 @@ def check_channel(url, stream_id):
             text=True,
             timeout=15  # Overall process timeout of 15 seconds
         )
-        load_time = time.time() - start_time
-        
+
         output = json.loads(result.stdout) if result.stdout.strip() else {}
 
         if 'streams' in output and len(output['streams']) > 0:
-            video_stream = next((s for s in output['streams'] if s.get('codec_type') == 'video'), None)
-            audio_stream = next((s for s in output['streams'] if s.get('codec_type') == 'audio'), None)
+            stream_info = output['streams'][0]
+            codec_name = stream_info.get('codec_name', 'Unknown')[:5]
+            width = stream_info.get('width', 'Unknown')
+            height = stream_info.get('height', 'Unknown')
+            avg_frame_rate = stream_info.get('avg_frame_rate', 'Unknown')
 
-            info = {
+            if avg_frame_rate != 'Unknown' and '/' in avg_frame_rate:
+                num, denom = map(int, avg_frame_rate.split('/'))
+                frame_rate = round(num / denom) if denom != 0 else "Unknown"
+            else:
+                frame_rate = avg_frame_rate
+
+            return {
                 "status": "working",
-                "load_time": f"{load_time:.2f}s",
-                "codec_name": "N/A", "width": "N/A", "height": "N/A", "frame_rate": "N/A", "video_bitrate": "N/A",
-                "audio_bitrate": "N/A"
+                "codec_name": codec_name,
+                "width": width,
+                "height": height,
+                "frame_rate": frame_rate
             }
-
-            if video_stream:
-                info["codec_name"] = video_stream.get('codec_name', 'Unknown')[:5]
-                info["width"] = video_stream.get('width', 'N/A')
-                info["height"] = video_stream.get('height', 'N/A')
-                avg_frame_rate = video_stream.get('avg_frame_rate', 'N/A')
-                if avg_frame_rate != 'N/A' and '/' in str(avg_frame_rate):
-                    num, denom = map(int, avg_frame_rate.split('/'))
-                    info["frame_rate"] = round(num / denom) if denom != 0 else "N/A"
-                else:
-                    info["frame_rate"] = avg_frame_rate
-                
-                if 'bit_rate' in video_stream:
-                    info["video_bitrate"] = f"{int(video_stream['bit_rate']) // 1000}k"
-                
-            if audio_stream and 'bit_rate' in audio_stream:
-                info["audio_bitrate"] = f"{int(audio_stream['bit_rate']) // 1000}k"
-
-            return info
         else:
             debug_log(f"No streams found in ffprobe output for URL: {url}")
-            return {"status": "not working", "load_time": f"{load_time:.2f}s"}
+            return {"status": "not working"}
     except subprocess.TimeoutExpired:
-        load_time = time.time() - start_time
         debug_log(f"Timeout when checking stream {stream_id}")
-        return {"status": "timeout", "load_time": f"{load_time:.2f}s"}
+        return {"status": "timeout", "codec_name": "N/A", "width": "N/A", "height": "N/A", "frame_rate": "N/A"}
     except Exception as e:
-        load_time = time.time() - start_time
         debug_log(f"Error in check_channel for stream {stream_id}: {e}")
-        return {"status": "error", "load_time": f"{load_time:.2f}s"}
+        return {"status": "error", "codec_name": "N/A", "width": "N/A", "height": "N/A", "frame_rate": "N/A"}
 
 def save_to_csv(file_name, data, fieldnames):
     """Save data to a CSV file, ensuring all fields are enclosed in double quotes."""
@@ -274,10 +262,10 @@ def main():
     filtered_streams = filter_data(live_categories, live_streams, args.category, args.channel)
 
     csv_data = []
-    fieldnames = ["Stream ID", "Name", "Category", "Archive", "EPG", "Load Time", "Codec", "Resolution", "Frame Rate", "Video Bitrate", "Audio Bitrate"]
+    fieldnames = ["Stream ID", "Name", "Category", "Archive", "EPG", "Codec", "Resolution", "Frame Rate"]
 
-    print(f"{'ID':<10}{'Name':<50} {'Category':<30}{'Archive':<8}{'EPG':<5}{'Load':<8}{'Codec':<8}{'Resolution':<12}{'Frame':<8}{'V-Rate':<10}{'A-Rate':<10}")
-    print("=" * 174)
+    print(f"{'ID':<10}{'Name':<60} {'Category':<40}{'Archive':<8}{'EPG':<5}{'Codec':<8}{'Resolution':<15}{'Frame':<10}")
+    print("=" * 152)
     category_map = {cat["category_id"]: cat["category_name"] for cat in live_categories}
     
     total_channels = len(filtered_streams)
@@ -293,8 +281,10 @@ def main():
         stream_url = f"http://{args.server}/{args.user}/{args.pw}/{stream['stream_id']}"
         stream_info = (
             check_channel(stream_url, stream["stream_id"]) if args.check 
-            else {}
+            else {"status": "", "codec_name": "", "width": "", "height": "", "frame_rate": ""}
         )
+        
+        # No need for extra sleep after check_channel as it has built-in connection management
         
         resolution = ""
         if args.check:
@@ -303,27 +293,17 @@ def main():
         # Progress indicator
         progress = f"[{i+1}/{total_channels}] "
         
-        print(f"{progress}{stream['stream_id']:<10}{stream['name'][:50]:<50} {category_name[:30]:<30}"
-              f"{stream.get('tv_archive_duration', 'N/A'):<8}{epg_count:<5}"
-              f"{stream_info.get('load_time', 'N/A'):<8}"
-              f"{stream_info.get('codec_name', 'N/A'):<8}"
-              f"{resolution:<12}"
-              f"{stream_info.get('frame_rate', 'N/A'):<8}"
-              f"{stream_info.get('video_bitrate', 'N/A'):<10}"
-              f"{stream_info.get('audio_bitrate', 'N/A'):<10}")
+        print(f"{stream['stream_id']:<10}{stream['name'][:60]:<60} {category_name[:40]:<40}{stream.get('tv_archive_duration', 'N/A'):<8}{epg_count:<5}{stream_info.get('codec_name', 'N/A'):<8}{resolution:<15}{stream_info.get('frame_rate', 'N/A'):<10}")
 
         csv_data.append({
             "Stream ID": stream["stream_id"],
-            "Name": stream['name'],
-            "Category": category_name,
+            "Name": stream['name'][:60],
+            "Category": category_name[:40],
             "Archive": stream.get('tv_archive_duration', 'N/A'),
             "EPG": epg_count,
-            "Load Time": stream_info.get('load_time', 'N/A'),
             "Codec": stream_info.get('codec_name', 'N/A'),
             "Resolution": resolution,
             "Frame Rate": stream_info.get('frame_rate', 'N/A'),
-            "Video Bitrate": stream_info.get('video_bitrate', 'N/A'),
-            "Audio Bitrate": stream_info.get('audio_bitrate', 'N/A'),
         })
 
     print(f"\n")
