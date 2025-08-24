@@ -8,7 +8,6 @@ import sys
 import time
 from datetime import datetime
 import concurrent.futures
-from tqdm import tqdm
 
 def calculate_stability_score(metrics):
     """
@@ -330,7 +329,8 @@ def main():
     enriched_channels = []
     
     # Process each channel with detailed analysis if requested
-    for channel in tqdm(channels, desc="Analyzing channels"):
+    total = len(channels)
+    for i, channel in enumerate(channels):
         # Create copy of channel data to enrich
         enriched = channel.copy()
         
@@ -371,6 +371,11 @@ def main():
         
         # Add to enriched list
         enriched_channels.append(enriched)
+        
+        # Print progress (simple alternative to tqdm)
+        print(f"Processing: {i+1}/{total} channels ({int((i+1)/total*100)}%)\r", end='')
+    
+    print("\n")  # Clear the progress line
     
     # Display summary
     print("\nChannel Analysis Complete")
