@@ -1,56 +1,70 @@
+#!/usr/bin/env python3
 import os
 import sys
-import requests
 import json
-import argparse
-import subprocess
-import signal
 import csv
 import time
+import math
 import random
+import signal
+import argparse
+import subprocess
+import threading
 from datetime import datetime
-from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
+
+# =========================
+# Configuration & Globals
+# =========================
 CACHE_FILE_PATTERN = "cache-{server}-{data_type}.json"
-DEBUG_MODE = False  # Default: Debugging is off
-MAX_CONNECTIONS = 3  # Maximum concurrent connections allowed
-connection_queue = deque(maxlen=MAX_CONNECTIONS)  # Track active connections
+DEBUG_MODE = False
 
-def debug_log(message):
-    """
-    Logs a debug message if debugging is enabled.
-    """
+# Locks for clean console output and shared state
+print_lock = threading.Lock()
+
+def debug_log(message: str):
     if DEBUG_MODE:
-        print(f"[DEBUG] {message}")
+        with print_lock:
+            print(f"[DEBUG] {message}")
 
+# =========================
+# Cache Utilities
+# =========================
 def load_cache(server, data_type):
-    """Load data from the cache file if it exists and is up-to-date."""
-    debug_log(f"Attempting to load cache for {data_type} on server {server}")
     cache_file = CACHE_FILE_PATTERN.format(server=server, data_type=data_type)
     if os.path.exists(cache_file):
-        # Check if the cache file was created today
+        # Consider cache valid for current day
         file_date = datetime.fromtimestamp(os.path.getmtime(cache_file)).date()
         if file_date == datetime.today().date():
             try:
-                with open(cache_file, 'r') as file:
-                    return json.load(file)
+                with open(cache_file, 'r', encoding="utf-8") as f:
+                    data = json.load(f)
+                debug_log(f"Loaded cache {cache_file}")
+                return data
             except (OSError, IOError, json.JSONDecodeError) as e:
                 print(f"Error reading cache file {cache_file}: {e}", file=sys.stderr)
     return None
 
 def save_cache(server, data_type, data):
-    """Save data to the cache file."""
-    debug_log(f"Attempting to save cache for {data_type} on server {server}")
     cache_file = CACHE_FILE_PATTERN.format(server=server, data_type=data_type)
     try:
-        with open(cache_file, 'w') as file:
-            json.dump(data, file)
+        with open(cache_file, 'w', encoding="utf-8") as f:
+            json.dump(data, f)
+        debug_log(f"Saved cache {cache_file}")
     except (OSError, IOError) as e:
         print(f"Error saving cache file {cache_file}: {e}", file=sys.stderr)
 
+# =========================
+# Provider API
+# =========================
 def download_data(server, user, password, endpoint, additional_params=None):
-    """Download data from the Xtream IPTV server."""
-    debug_log(f"Downloading data from {server}, endpoint: {endpoint}")
+    """
+    Download data from Xtream player_api.
+    These calls generally do not count towards concurrent STREAM sessions,
+    but can be rate-limited/blocked if abused.
+    """
     url = f"http://{server}/player_api.php"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"
@@ -58,49 +72,38 @@ def download_data(server, user, password, endpoint, additional_params=None):
     params = {"username": user, "password": password, "action": endpoint}
     if additional_params:
         params.update(additional_params)
-    response = requests.get(url, headers=headers, params=params)
-    if response.status_code == 200:
-        debug_log(f"Response from server ({endpoint}): {response.text[:500]}")
-        return response.json()
+
+    resp = requests.get(url, headers=headers, params=params, timeout=15)
+    if resp.status_code == 200:
+        try:
+            return resp.json()
+        except json.JSONDecodeError:
+            debug_log(f"Non-JSON response for {endpoint}: {resp.text[:300]}")
+            return None
     else:
-        print(f"Failed to fetch {endpoint} data: {response.status_code}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(f"Failed to fetch {endpoint}: HTTP {resp.status_code}")
 
 def check_epg(server, user, password, stream_id):
-    """Check EPG data for a specific channel."""
-    debug_log(f"Checking EPG for stream ID {stream_id}")
-    epg_data = download_data(server, user, password, "get_simple_data_table", {"stream_id": stream_id})
+    """
+    Get EPG listing count for a channel.
+    Keep this lightweight; API calls usually aren't counted as streaming connections.
+    """
+    try:
+        epg = download_data(server, user, password, "get_simple_data_table", {"stream_id": stream_id})
+        if isinstance(epg, dict) and epg.get("epg_listings"):
+            return len(epg["epg_listings"])
+        elif isinstance(epg, list):
+            return len(epg)
+        else:
+            return 0
+    except Exception as e:
+        debug_log(f"EPG fetch error for stream {stream_id}: {e}")
+        return 0
 
-    if isinstance(epg_data, dict) and epg_data.get("epg_listings"):
-        return len(epg_data["epg_listings"])  # Return the count of EPG entries
-
-    elif isinstance(epg_data, list):
-        debug_log(f"Unexpected list response for EPG data: {epg_data}")
-        return len(epg_data)  # Return the length of the list
-
-    else:
-        debug_log(f"Unexpected EPG response type: {type(epg_data)}")
-        return 0  # No EPG data available
-
-def filter_data(live_categories, live_streams, group, channel):
-    """Filter the live streams based on group and channel arguments."""
-    filtered_streams = []
-    group = group.lower() if group else None
-    channel = channel.lower() if channel else None
-
-    for stream in live_streams:
-        if group:
-            matching_categories = [cat for cat in live_categories if group in cat["category_name"].lower()]
-            if not any(cat["category_id"] == stream["category_id"] for cat in matching_categories):
-                continue
-        if channel and channel not in stream["name"].lower():
-            continue
-        filtered_streams.append(stream)
-
-    return filtered_streams
-
-def check_ffprobe():
-    """Checks if the ffprobe command is available on the system."""
+# =========================
+# ffprobe Utilities
+# =========================
+def check_ffprobe_available():
     try:
         subprocess.run(
             ["ffprobe", "-version"],
@@ -108,208 +111,395 @@ def check_ffprobe():
             stderr=subprocess.PIPE,
             check=True,
         )
-        debug_log("ffprobe is installed and reachable.")
+        debug_log("ffprobe is installed.")
+        return True
     except FileNotFoundError:
-        print("Error: ffprobe is not installed or not found in the system PATH. Please install ffprobe before running this program.")
-        sys.exit(1)
+        print("Error: ffprobe not found in PATH. Install ffmpeg/ffprobe.", file=sys.stderr)
+        return False
     except subprocess.CalledProcessError as e:
-        print(f"Error: ffprobe check failed with error: {e}")
-        sys.exit(1)
+        print(f"Error: ffprobe check failed: {e}", file=sys.stderr)
+        return False
 
-def manage_connections(stream_id):
-    """
-    Manage connection queue to prevent exceeding connection limit.
-    Returns how long to wait before proceeding.
-    """
-    current_time = time.time()
-    
-    # Remove expired connections (older than 60 seconds)
-    while connection_queue and current_time - connection_queue[0][1] > 60:
-        connection_queue.popleft()
-    
-    # If we're at max connections, wait
-    if len(connection_queue) >= MAX_CONNECTIONS:
-        # Calculate wait time based on oldest connection
-        wait_time = max(5, 60 - (current_time - connection_queue[0][1])) 
-        debug_log(f"Connection limit reached. Waiting {wait_time:.1f} seconds before checking stream {stream_id}.")
-        return wait_time
-    
-    # Add this connection to the queue
-    connection_queue.append((stream_id, current_time))
-    return 0
-
-def check_channel(url, stream_id):
-    """Check channel details using ffprobe with connection management."""
-    # First, manage connections to avoid exceeding limits
-    wait_time = manage_connections(stream_id)
-    if wait_time > 0:
-        time.sleep(wait_time)
-    
-    # Add a small random delay to prevent exactly simultaneous connections
-    jitter = random.uniform(0.5, 2.0)
-    time.sleep(jitter)
-    
-    debug_log(f"Checking stream {stream_id} with URL: {url}")
-    
+def parse_frame_rate(avg_frame_rate):
+    if not avg_frame_rate or avg_frame_rate == "N/A":
+        return "N/A"
+    if isinstance(avg_frame_rate, (int, float)):
+        return round(avg_frame_rate)
+    if "/" in avg_frame_rate:
+        try:
+            num, denom = avg_frame_rate.split("/")
+            num = float(num)
+            denom = float(denom)
+            if denom == 0:
+                return "N/A"
+            return round(num / denom)
+        except Exception:
+            return "N/A"
     try:
-        result = subprocess.run(
-            [
-                "ffprobe",
-                "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=codec_name,width,height,avg_frame_rate",
-                "-of", "json",
-                "-timeout", "10000000",  # 10 seconds timeout in microseconds
-                url
-            ],
+        return round(float(avg_frame_rate))
+    except Exception:
+        return "N/A"
+
+def human_kbps(bit_rate_value):
+    """
+    Normalize various bit_rate representations to integer kbps string.
+    """
+    if not bit_rate_value or bit_rate_value == "N/A":
+        return "N/A"
+    try:
+        # Some ffprobe return strings; ensure int
+        br = int(float(bit_rate_value))
+        if br <= 0:
+            return "N/A"
+        # Convert bps -> kbps
+        return str(int(round(br / 1000.0)))
+    except Exception:
+        return "N/A"
+
+def ffprobe_channel(url, timeout_sec, rw_timeout_ms, analyze_ms, probesize_bytes, extra_http_connect=False):
+    """
+    Invoke ffprobe with conservative probing to reduce on-wire time.
+    Returns dict with status and stream info including bitrate.
+    """
+    # Keep the probe short; many providers count you as connected while ffprobe is running.
+    args = [
+        "ffprobe",
+        "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name,width,height,avg_frame_rate,bit_rate:format=bit_rate",
+        "-of", "json",
+        # Keep probing minimal
+        "-analyzeduration", str(int(analyze_ms * 1000)),    # microseconds
+        "-probesize", str(int(probesize_bytes)),            # bytes
+        # Tight IO timeout at the protocol layer
+        "-rw_timeout", str(int(rw_timeout_ms * 1000)),      # microseconds
+        # Reduce buffering
+        "-fflags", "nobuffer",
+    ]
+
+    # Optional reconnect hints (some builds accept these for HTTP)
+    if extra_http_connect:
+        args.extend(["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2"])
+
+    args.append(url)
+
+    try:
+        proc = subprocess.run(
+            args,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=15  # Overall process timeout of 15 seconds
+            timeout=timeout_sec
         )
+        out = proc.stdout.strip()
+        if not out:
+            return {"status": "no_data"}
 
-        output = json.loads(result.stdout) if result.stdout.strip() else {}
+        data = json.loads(out)
+        streams = data.get("streams") or []
+        fmt = data.get("format") or {}
+        if not streams:
+            return {"status": "no_stream"}
 
-        if 'streams' in output and len(output['streams']) > 0:
-            stream_info = output['streams'][0]
-            codec_name = stream_info.get('codec_name', 'Unknown')[:5]
-            width = stream_info.get('width', 'Unknown')
-            height = stream_info.get('height', 'Unknown')
-            avg_frame_rate = stream_info.get('avg_frame_rate', 'Unknown')
+        s0 = streams[0]
+        codec = s0.get("codec_name") or "Unknown"
+        width = s0.get("width") or "N/A"
+        height = s0.get("height") or "N/A"
+        fps = parse_frame_rate(s0.get("avg_frame_rate") or "N/A")
 
-            if avg_frame_rate != 'Unknown' and '/' in avg_frame_rate:
-                num, denom = map(int, avg_frame_rate.split('/'))
-                frame_rate = round(num / denom) if denom != 0 else "Unknown"
-            else:
-                frame_rate = avg_frame_rate
+        # Try stream bit_rate first; fallback to container format bit_rate
+        br_stream = human_kbps(s0.get("bit_rate"))
+        br_format = human_kbps(fmt.get("bit_rate"))
+        bitrate_kbps = br_stream if br_stream != "N/A" else br_format
 
-            return {
-                "status": "working",
-                "codec_name": codec_name,
-                "width": width,
-                "height": height,
-                "frame_rate": frame_rate
-            }
-        else:
-            debug_log(f"No streams found in ffprobe output for URL: {url}")
-            return {"status": "not working"}
+        return {
+            "status": "ok",
+            "codec_name": codec,
+            "width": width,
+            "height": height,
+            "frame_rate": fps,
+            "bitrate_kbps": bitrate_kbps
+        }
     except subprocess.TimeoutExpired:
-        debug_log(f"Timeout when checking stream {stream_id}")
-        return {"status": "timeout", "codec_name": "N/A", "width": "N/A", "height": "N/A", "frame_rate": "N/A"}
+        return {"status": "timeout"}
     except Exception as e:
-        debug_log(f"Error in check_channel for stream {stream_id}: {e}")
-        return {"status": "error", "codec_name": "N/A", "width": "N/A", "height": "N/A", "frame_rate": "N/A"}
+        debug_log(f"ffprobe error: {e}")
+        return {"status": "error"}
 
+# =========================
+# Filtering
+# =========================
+def filter_streams(live_categories, live_streams, group, channel):
+    filtered = []
+    group_l = group.lower() if group else None
+    channel_l = channel.lower() if channel else None
+
+    # Precompute category filter set if group provided
+    allowed_cat_ids = None
+    if group_l:
+        allowed_cat_ids = {
+            c["category_id"] for c in live_categories
+            if group_l in (c.get("category_name") or "").lower()
+        }
+
+    for s in live_streams:
+        if allowed_cat_ids is not None:
+            if s.get("category_id") not in allowed_cat_ids:
+                continue
+        if channel_l and channel_l not in (s.get("name") or "").lower():
+            continue
+        filtered.append(s)
+    return filtered
+
+# =========================
+# Concurrency Management
+# =========================
+class StreamSlotManager:
+    """
+    Manages concurrently active STREAM probes (not API calls).
+    Uses a semaphore of size N.
+    Optionally holds a slot for `grace_hold` seconds after probe to account for
+    providers lingering sessions briefly.
+    """
+    def __init__(self, max_slots: int, grace_hold: float):
+        self.sem = threading.Semaphore(max_slots)
+        self.grace_hold = max(0.0, float(grace_hold))
+
+    def acquire(self):
+        self.sem.acquire()
+
+    def release(self):
+        # Hold the slot briefly to avoid immediate reuse while the provider still
+        # counts the session as open.
+        if self.grace_hold > 0:
+            time.sleep(self.grace_hold)
+        self.sem.release()
+
+# =========================
+# CSV
+# =========================
 def save_to_csv(file_name, data, fieldnames):
-    """Save data to a CSV file, ensuring all fields are enclosed in double quotes."""
     try:
-        with open(file_name, "w", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+        with open(file_name, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
             writer.writeheader()
             writer.writerows(data)
         print(f"Output saved to {file_name}")
     except Exception as e:
-        print(f"Error saving to CSV: {e}")
+        print(f"Error saving to CSV: {e}", file=sys.stderr)
 
-def handle_sigint(signal, frame):
-    """Handle Ctrl+C gracefully."""
-    print("\nProgram interrupted by user. Exiting...")
-    sys.exit(0)
+# =========================
+# Worker
+# =========================
+def analyze_stream(
+    stream,
+    category_map,
+    args,
+    slot_mgr: StreamSlotManager,
+    index: int,
+    total: int,
+    server: str,
+    user: str,
+    pw: str,
+):
+    """
+    Worker function to:
+    - optionally check EPG count
+    - probe stream with ffprobe under slot/semaphore control
+    """
+    stream_id = stream["stream_id"]
+    name = (stream.get("name") or "")[:60]
+    category_name = (category_map.get(stream.get("category_id")) or "Unknown")[:40]
 
+    # EPG count via player_api (usually not a counted stream connection)
+    epg_count = ""
+    if args.epgcheck:
+        # Small jitter to avoid bursty API calls
+        time.sleep(random.uniform(0.05, 0.2))
+        epg_count = check_epg(server, user, pw, stream_id)
+
+    # STREAM PROBE (counted)
+    codec = ""
+    width = ""
+    height = ""
+    fps = ""
+    bitrate_kbps = ""
+
+    if args.check:
+        # Randomized jitter before opening a stream to avoid stampeding patterns
+        time.sleep(random.uniform(0.3, 1.2))
+        slot_mgr.acquire()
+        try:
+            # Build URL and run ffprobe
+            url = f"http://{server}/{user}/{pw}/{stream_id}"
+            info = ffprobe_channel(
+                url=url,
+                timeout_sec=args.ffprobe_timeout,
+                rw_timeout_ms=args.ffprobe_rw_timeout_ms,
+                analyze_ms=args.ffprobe_analyze_ms,
+                probesize_bytes=args.ffprobe_probesize,
+                extra_http_connect=args.ffprobe_reconnect
+            )
+            if info.get("status") == "ok":
+                codec = (info.get("codec_name") or "")[:8]
+                width = info.get("width") or "N/A"
+                height = info.get("height") or "N/A"
+                fps = info.get("frame_rate") or "N/A"
+                bitrate_kbps = info.get("bitrate_kbps") or "N/A"
+            else:
+                codec = info.get("status", "error")
+                width = "N/A"
+                height = "N/A"
+                fps = "N/A"
+                bitrate_kbps = "N/A"
+        finally:
+            slot_mgr.release()
+
+    # Print line
+    resolution = f"{width}x{height}" if args.check else ""
+    with print_lock:
+        progress = f"[{index}/{total}] "
+        print(
+            f"{progress}{str(stream_id):<8} {name:<60} {category_name:<40} "
+            f"{str(stream.get('tv_archive_duration', 'N/A')):<8} {str(epg_count):<5} "
+            f"{str(codec):<8} {resolution:<15} {str(fps):<5} {str(bitrate_kbps):<8}kbps"
+        )
+
+    # Prepare CSV row
+    return {
+        "Stream ID": stream_id,
+        "Name": name,
+        "Category": category_name,
+        "Archive": stream.get('tv_archive_duration', 'N/A'),
+        "EPG": epg_count,
+        "Codec": codec,
+        "Resolution": resolution,
+        "Frame Rate": fps,
+        "Bitrate (kbps)": bitrate_kbps
+    }
+
+# =========================
+# Main
+# =========================
 def main():
     global DEBUG_MODE
 
+    def handle_sigint(sig, frame):
+        print("\nInterrupted by user. Exiting...")
+        sys.exit(0)
+
     signal.signal(signal.SIGINT, handle_sigint)
 
-    parser = argparse.ArgumentParser(description="Xtream IPTV Downloader and Filter")
-    parser.add_argument("--server", required=True, help="The Xtream server to connect to.")
-    parser.add_argument("--user", required=True, help="The username to use.")
-    parser.add_argument("--pw", required=True, help="The password to use.")
-    parser.add_argument("--nocache", action="store_true", help="Force download and ignore cache.")
-    parser.add_argument("--channel", help="Filter by channel name.")
-    parser.add_argument("--category", help="Filter by category name.")
-    parser.add_argument("--debug", action="store_true", help="Enable debug mode.")
-    parser.add_argument("--epgcheck", action="store_true", help="Check if channels provide EPG data and count entries.")
-    parser.add_argument("--check", action="store_true", help="Check stream resolution and frame rate using ffprobe.")
-    parser.add_argument("--save", help="Save the output to a CSV file. Provide the file name.")
-    parser.add_argument("--max-connections", type=int, default=3, 
-                        help="Maximum concurrent connections to the server (default: 3).")
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description="Xtream IPTV channel analyzer with connection-aware ffprobe.")
+    parser.add_argument("--server", required=True, help="Xtream server host:port")
+    parser.add_argument("--user", required=True, help="Username")
+    parser.add_argument("--pw", required=True, help="Password")
 
-    global MAX_CONNECTIONS
-    MAX_CONNECTIONS = args.max_connections
+    parser.add_argument("--nocache", action="store_true", help="Ignore cache and fetch fresh lists")
+    parser.add_argument("--channel", help="Filter by channel name (substring match)")
+    parser.add_argument("--category", help="Filter by category name (substring match)")
+
+    parser.add_argument("--epgcheck", action="store_true", help="Fetch EPG counts per channel")
+    parser.add_argument("--check", action="store_true", help="Probe stream for quality/fps/bitrate via ffprobe")
+
+    parser.add_argument("--save", help="Save output to CSV file")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logs")
+
+    # Connection and probe controls
+    parser.add_argument("--stream-concurrency", type=int, default=2,
+                        help="Max concurrent stream probes (default: 2). Set to 3 if provider is tolerant.")
+    parser.add_argument("--grace-hold", type=float, default=8.0,
+                        help="Seconds to hold a slot after ffprobe exit to avoid lingering session overlap (default: 8)")
+
+    # ffprobe tuning
+    parser.add_argument("--ffprobe-timeout", type=int, default=12, help="Overall ffprobe process timeout seconds (default: 12)")
+    parser.add_argument("--ffprobe-rw-timeout-ms", type=int, default=3000, help="I/O timeout for ffprobe AVIO (microseconds input), specify in ms (default: 3000)")
+    parser.add_argument("--ffprobe-analyze-ms", type=int, default=700, help="Analyze duration in ms (default: 700)")
+    parser.add_argument("--ffprobe-probesize", type=int, default=512_000, help="Probe size in bytes (default: 512000)")
+    parser.add_argument("--ffprobe-reconnect", action="store_true", help="Enable ffprobe HTTP reconnect hints")
+
+    # Worker threads for scheduling tasks (not the same as stream concurrency)
+    parser.add_argument("--workers", type=int, default=4, help="Thread pool size to schedule probes (default: 4)")
+
+    args = parser.parse_args()
+    DEBUG_MODE = args.debug
+
+    # Validate ffprobe when needed
+    if args.check and not check_ffprobe_available():
+        sys.exit(1)
 
     masked_server = f"{'.'.join(['xxxxx'] + args.server.split('.')[1:])}"
     run_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-    print(f"\n\nfind-iptv-channels-details - Running for server {masked_server} on {run_time}\n")
-    print(f"Connection limit set to: {MAX_CONNECTIONS}")
-
-    DEBUG_MODE = args.debug
-    debug_log("Debug mode enabled")
-
+    print(f"\nfind-iptv-channels-details - Running for server {masked_server} on {run_time}")
+    print(f"Stream concurrency limit: {args.stream_concurrency} (grace-hold: {args.grace_hold}s)")
     if args.check:
-        check_ffprobe()
+        debug_log(f"ffprobe: timeout={args.ffprobe_timeout}s, rw_timeout={args.ffprobe_rw_timeout_ms}ms, "
+                  f"analyze={args.ffprobe_analyze_ms}ms, probesize={args.ffprobe_probesize} bytes, reconnect={args.ffprobe_reconnect}")
 
-    live_categories = load_cache(args.server, "live_categories") if not args.nocache else None
-    live_streams = load_cache(args.server, "live_streams") if not args.nocache else None
+    # Fetch live categories and streams (cache per day)
+    if not args.nocache:
+        live_categories = load_cache(args.server, "live_categories")
+        live_streams = load_cache(args.server, "live_streams")
+    else:
+        live_categories, live_streams = None, None
 
     if not live_categories or not live_streams:
-        live_categories = download_data(args.server, args.user, args.pw, "get_live_categories")
-        live_streams = download_data(args.server, args.user, args.pw, "get_live_streams")
+        debug_log("Fetching categories/streams from provider...")
+        live_categories = download_data(args.server, args.user, args.pw, "get_live_categories") or []
+        live_streams = download_data(args.server, args.user, args.pw, "get_live_streams") or []
         save_cache(args.server, "live_categories", live_categories)
         save_cache(args.server, "live_streams", live_streams)
 
-    filtered_streams = filter_data(live_categories, live_streams, args.category, args.channel)
+    # Build category map
+    category_map = {c.get("category_id"): c.get("category_name", "") for c in live_categories}
 
-    csv_data = []
-    fieldnames = ["Stream ID", "Name", "Category", "Archive", "EPG", "Codec", "Resolution", "Frame Rate"]
+    # Filter streams
+    filtered = filter_streams(live_categories, live_streams, args.category, args.channel)
+    total = len(filtered)
 
-    print(f"{'ID':<10}{'Name':<60} {'Category':<40}{'Archive':<8}{'EPG':<5}{'Codec':<8}{'Resolution':<15}{'Frame':<10}")
-    print("=" * 152)
-    category_map = {cat["category_id"]: cat["category_name"] for cat in live_categories}
-    
-    total_channels = len(filtered_streams)
-    for i, stream in enumerate(filtered_streams):
-        category_name = category_map.get(stream["category_id"], "Unknown")
-        epg_count = ""
-        
-        if args.epgcheck:
-            epg_count = check_epg(args.server, args.user, args.pw, stream["stream_id"])
-            # Increased sleep to better manage connections with EPG
-            time.sleep(5)  
+    # Header
+    print("")
+    print(f"{'':<10}{'ID':<8} {'Name':<60} {'Category':<40} {'Arch':<8} {'EPG':<5} {'Codec':<8} {'Resolution':<15} {'FPS':<5} {'Bitrate':<10}")
+    print("=" * 170)
 
-        stream_url = f"http://{args.server}/{args.user}/{args.pw}/{stream['stream_id']}"
-        stream_info = (
-            check_channel(stream_url, stream["stream_id"]) if args.check 
-            else {"status": "", "codec_name": "", "width": "", "height": "", "frame_rate": ""}
-        )
-        
-        # No need for extra sleep after check_channel as it has built-in connection management
-        
-        resolution = ""
-        if args.check:
-            resolution = f"{stream_info.get('width', 'N/A')}x{stream_info.get('height', 'N/A')}"
-        
-        # Progress indicator
-        progress = f"[{i+1}/{total_channels}] "
-        
-        print(f"{stream['stream_id']:<10}{stream['name'][:60]:<60} {category_name[:40]:<40}{stream.get('tv_archive_duration', 'N/A'):<8}{epg_count:<5}{stream_info.get('codec_name', 'N/A'):<8}{resolution:<15}{stream_info.get('frame_rate', 'N/A'):<10}")
+    if total == 0:
+        print("No streams match the filter.")
+        return
 
-        csv_data.append({
-            "Stream ID": stream["stream_id"],
-            "Name": stream['name'][:60],
-            "Category": category_name[:40],
-            "Archive": stream.get('tv_archive_duration', 'N/A'),
-            "EPG": epg_count,
-            "Codec": stream_info.get('codec_name', 'N/A'),
-            "Resolution": resolution,
-            "Frame Rate": stream_info.get('frame_rate', 'N/A'),
-        })
+    # Slot manager enforces STREAM connection cap
+    slot_mgr = StreamSlotManager(max_slots=max(1, args.stream_concurrency), grace_hold=args.grace_hold)
 
-    print(f"\n")
+    rows = []
+    futures = []
+    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        for idx, stream in enumerate(filtered, start=1):
+            futures.append(
+                pool.submit(
+                    analyze_stream,
+                    stream,
+                    category_map,
+                    args,
+                    slot_mgr,
+                    idx,
+                    total,
+                    args.server,
+                    args.user,
+                    args.pw
+                )
+            )
+
+        for f in as_completed(futures):
+            row = f.result()
+            rows.append(row)
+
+    # Save CSV if requested
     if args.save:
-        save_to_csv(args.save, csv_data, fieldnames)
-    print(f"\n\n")
+        fieldnames = ["Stream ID", "Name", "Category", "Archive", "EPG", "Codec", "Resolution", "Frame Rate", "Bitrate (kbps)"]
+        # Keep CSV in original order of filtered streams
+        rows_sorted = sorted(rows, key=lambda r: filtered.index(next(s for s in filtered if s["stream_id"] == r["Stream ID"])))
+        save_to_csv(args.save, rows_sorted, fieldnames)
+
+    print("\nDone.\n")
 
 if __name__ == "__main__":
     main()
