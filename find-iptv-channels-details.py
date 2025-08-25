@@ -267,6 +267,42 @@ class StreamSlotManager:
         self.sem.release()
 
 # =========================
+# Color utilities
+# =========================
+ANSI_RESET = "\033[0m"
+ANSI_RED = "\033[31m"            # dark red
+ANSI_YELLOW = "\033[33m"         # used for "orange" fallback and 49 fps
+ANSI_GREEN = "\033[32m"
+ANSI_BRIGHT_GREEN = "\033[92m"   # "neon green"
+ANSI_LIGHT_BLUE = "\033[94m"
+ANSI_ORANGE_256 = "\033[38;5;208m"  # true orange in 256-color terminals
+
+def colorize(s: str, code: str, enabled: bool):
+    if not enabled or not code:
+        return s
+    return f"{code}{s}{ANSI_RESET}"
+
+def pad_then_color(s: str, width: int, code: str, enabled: bool, align_left=True):
+    if align_left:
+        plain = s.ljust(width)
+    else:
+        plain = s.rjust(width)
+    return colorize(plain, code, enabled)
+
+def to_int_or_none(v):
+    try:
+        if v is None:
+            return None
+        if isinstance(v, (int, float)):
+            return int(v)
+        sv = str(v).strip()
+        if sv.isdigit():
+            return int(sv)
+        return int(float(sv))
+    except Exception:
+        return None
+
+# =========================
 # CSV
 # =========================
 def save_to_csv(file_name, data, fieldnames):
@@ -308,6 +344,8 @@ def analyze_stream(
     height = ""
     fps = ""
     bitrate_kbps = ""
+    status = "ok"
+    connected_via_fallback = False
 
     if args.check:
         time.sleep(random.uniform(0.3, 1.2))  # jitter before opening stream
@@ -322,42 +360,102 @@ def analyze_stream(
                 probesize_bytes=args.ffprobe_probesize,
                 extra_http_connect=args.ffprobe_reconnect
             )
-            if info.get("status") == "ok":
+            status = info.get("status", "error")
+            if status == "ok":
                 codec = (info.get("codec_name") or "")[:8]
                 width = info.get("width") or "N/A"
                 height = info.get("height") or "N/A"
                 fps = info.get("frame_rate") or "N/A"
                 bitrate_kbps = info.get("bitrate_kbps") or "N/A"
             else:
-                codec = info.get("status", "error")
+                codec = status
                 width = "N/A"
                 height = "N/A"
                 fps = "N/A"
                 bitrate_kbps = "N/A"
 
-            # Bitrate fallback if missing
+            # Bitrate fallback if missing; if we get data here, we consider the stream reachable
             if args.bitrate_fallback and (not bitrate_kbps or bitrate_kbps == "N/A"):
-                # small gap to reduce “lingering session” overlap
                 if args.bitrate_fallback_gap > 0:
                     time.sleep(args.bitrate_fallback_gap)
-                bitrate_kbps = measure_bitrate_active(
+                bitrate_kbps_fb = measure_bitrate_active(
                     url=url,
                     sample_sec=args.bitrate_fallback_sample_sec,
                     max_bytes=args.bitrate_fallback_bytes
                 )
+                if bitrate_kbps_fb and bitrate_kbps_fb != "N/A":
+                    bitrate_kbps = bitrate_kbps_fb
+                    connected_via_fallback = True
         finally:
             slot_mgr.release()
 
     resolution = f"{width}x{height}" if args.check else ""
     bitrate_str = f"{bitrate_kbps} kbps" if bitrate_kbps and bitrate_kbps != "N/A" else "N/A"
 
+    # Determine offline (not detected / can't find connection)
+    offline_statuses = {"timeout", "error", "no_data", "no_stream", "not working"}
+    is_offline = args.check and (status in offline_statuses) and (not connected_via_fallback)
+
+    # Build display with colors
     with print_lock:
         progress = f"[{index}/{total}] "
-        print(
-            f"{progress}{str(stream_id):<8} {name:<60} {category_name:<40} "
-            f"{str(stream.get('tv_archive_duration', 'N/A')):<8} {str(epg_count):<5} "
-            f"{str(codec):<8} {resolution:<15} {str(fps):<5} {bitrate_str:<12}"
+        id_col = f"{str(stream_id):<8}"
+        name_col = f"{name:<60}"
+        cat_col = f"{category_name:<40}"
+        arch_col = f"{str(stream.get('tv_archive_duration', 'N/A')):<8}"
+        epg_col = f"{str(epg_count):<5}"
+        codec_col = f"{str(codec):<8}"
+
+        # Prepare resolution colorization
+        res_display = ""
+        fps_display = ""
+        bitrate_display = f"{bitrate_str:<12}"
+
+        if args.check:
+            # Resolution color rules based on height
+            height_num = to_int_or_none(height)
+            res_plain = resolution  # e.g., "1920x1080"
+            if is_offline or height_num is None:
+                res_display = f"{res_plain:<15}"
+            else:
+                if height_num <= 540:
+                    res_color = ANSI_RED
+                elif height_num <= 720:
+                    res_color = ANSI_ORANGE_256 if args.color_enabled else ANSI_YELLOW
+                elif height_num <= 1080:
+                    res_color = ANSI_GREEN
+                else:
+                    res_color = ANSI_LIGHT_BLUE
+                res_display = pad_then_color(res_plain, 15, res_color, args.color_enabled)
+
+            # FPS color rules
+            fps_num = to_int_or_none(fps)
+            fps_plain = str(fps)
+            if is_offline or fps_num is None:
+                fps_display = f"{fps_plain:<5}"
+            else:
+                if fps_num == 49:
+                    fps_color = ANSI_YELLOW
+                elif fps_num > 49:
+                    fps_color = ANSI_BRIGHT_GREEN
+                else:
+                    fps_color = ""  # default color for <= 49 except 49 itself
+                fps_display = pad_then_color(fps_plain, 5, fps_color, args.color_enabled)
+        else:
+            res_display = f"{'':<15}"
+            fps_display = f"{'':<5}"
+
+        # Assemble the line
+        line = (
+            f"{progress}{id_col} {name_col} {cat_col} "
+            f"{arch_col} {epg_col} {codec_col} {res_display} {fps_display} {bitrate_display}"
         )
+
+        # If offline, color the entire line dark red
+        if is_offline and args.color_enabled:
+            line = colorize(line, ANSI_RED, True)
+
+        print(line)
 
     return {
         "Stream ID": stream_id,
@@ -366,8 +464,8 @@ def analyze_stream(
         "Archive": stream.get('tv_archive_duration', 'N/A'),
         "EPG": epg_count,
         "Codec": codec,
-        "Resolution": resolution,
-        "Frame Rate": fps,
+        "Resolution": resolution if args.check else "",
+        "Frame Rate": fps if args.check else "",
         "Bitrate (kbps)": bitrate_kbps if bitrate_kbps and bitrate_kbps != "N/A" else "N/A"
     }
 
@@ -422,8 +520,21 @@ def main():
     parser.add_argument("--bitrate-fallback-bytes", type=int, default=2_000_000, help="Max bytes to read during fallback (default: 2,000,000)")
     parser.add_argument("--bitrate-fallback-gap", type=float, default=1.0, help="Seconds to wait after ffprobe before fallback to avoid overlap (default: 1.0)")
 
+    # Color controls
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors in console output")
+    parser.add_argument("--force-color", action="store_true", help="Force-enable ANSI colors even if stdout is not a TTY")
+
     args = parser.parse_args()
     DEBUG_MODE = args.debug
+
+    # Determine color support
+    args.color_enabled = (not args.no_color) and (args.force_color or sys.stdout.isatty())
+    if args.color_enabled and os.name == "nt":
+        try:
+            import colorama
+            colorama.just_fix_windows_console()
+        except Exception:
+            pass  # best-effort; recent Windows terminals support ANSI without this
 
     if args.check and not check_ffprobe_available():
         sys.exit(1)
