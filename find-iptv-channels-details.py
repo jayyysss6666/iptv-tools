@@ -4,7 +4,6 @@ import sys
 import json
 import csv
 import time
-import math
 import random
 import signal
 import argparse
@@ -20,6 +19,7 @@ import requests
 # =========================
 CACHE_FILE_PATTERN = "cache-{server}-{data_type}.json"
 DEBUG_MODE = False
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"
 
 # Locks for clean console output and shared state
 print_lock = threading.Lock()
@@ -35,7 +35,6 @@ def debug_log(message: str):
 def load_cache(server, data_type):
     cache_file = CACHE_FILE_PATTERN.format(server=server, data_type=data_type)
     if os.path.exists(cache_file):
-        # Consider cache valid for current day
         file_date = datetime.fromtimestamp(os.path.getmtime(cache_file)).date()
         if file_date == datetime.today().date():
             try:
@@ -60,15 +59,8 @@ def save_cache(server, data_type, data):
 # Provider API
 # =========================
 def download_data(server, user, password, endpoint, additional_params=None):
-    """
-    Download data from Xtream player_api.
-    These calls generally do not count towards concurrent STREAM sessions,
-    but can be rate-limited/blocked if abused.
-    """
     url = f"http://{server}/player_api.php"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"
-    }
+    headers = {"User-Agent": USER_AGENT}
     params = {"username": user, "password": password, "action": endpoint}
     if additional_params:
         params.update(additional_params)
@@ -84,10 +76,6 @@ def download_data(server, user, password, endpoint, additional_params=None):
         raise RuntimeError(f"Failed to fetch {endpoint}: HTTP {resp.status_code}")
 
 def check_epg(server, user, password, stream_id):
-    """
-    Get EPG listing count for a channel.
-    Keep this lightweight; API calls usually aren't counted as streaming connections.
-    """
     try:
         epg = download_data(server, user, password, "get_simple_data_table", {"stream_id": stream_id})
         if isinstance(epg, dict) and epg.get("epg_listings"):
@@ -141,46 +129,31 @@ def parse_frame_rate(avg_frame_rate):
         return "N/A"
 
 def human_kbps(bit_rate_value):
-    """
-    Normalize various bit_rate representations to integer kbps string.
-    """
     if not bit_rate_value or bit_rate_value == "N/A":
         return "N/A"
     try:
-        # Some ffprobe return strings; ensure int
         br = int(float(bit_rate_value))
         if br <= 0:
             return "N/A"
-        # Convert bps -> kbps
-        return str(int(round(br / 1000.0)))
+        return str(int(round(br / 1000.0)))  # bps -> kbps
     except Exception:
         return "N/A"
 
 def ffprobe_channel(url, timeout_sec, rw_timeout_ms, analyze_ms, probesize_bytes, extra_http_connect=False):
-    """
-    Invoke ffprobe with conservative probing to reduce on-wire time.
-    Returns dict with status and stream info including bitrate.
-    """
-    # Keep the probe short; many providers count you as connected while ffprobe is running.
     args = [
         "ffprobe",
         "-v", "error",
         "-select_streams", "v:0",
         "-show_entries", "stream=codec_name,width,height,avg_frame_rate,bit_rate:format=bit_rate",
         "-of", "json",
-        # Keep probing minimal
         "-analyzeduration", str(int(analyze_ms * 1000)),    # microseconds
         "-probesize", str(int(probesize_bytes)),            # bytes
-        # Tight IO timeout at the protocol layer
         "-rw_timeout", str(int(rw_timeout_ms * 1000)),      # microseconds
-        # Reduce buffering
         "-fflags", "nobuffer",
+        "-user_agent", USER_AGENT,
     ]
-
-    # Optional reconnect hints (some builds accept these for HTTP)
     if extra_http_connect:
         args.extend(["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2"])
-
     args.append(url)
 
     try:
@@ -207,7 +180,6 @@ def ffprobe_channel(url, timeout_sec, rw_timeout_ms, analyze_ms, probesize_bytes
         height = s0.get("height") or "N/A"
         fps = parse_frame_rate(s0.get("avg_frame_rate") or "N/A")
 
-        # Try stream bit_rate first; fallback to container format bit_rate
         br_stream = human_kbps(s0.get("bit_rate"))
         br_format = human_kbps(fmt.get("bit_rate"))
         bitrate_kbps = br_stream if br_stream != "N/A" else br_format
@@ -227,6 +199,35 @@ def ffprobe_channel(url, timeout_sec, rw_timeout_ms, analyze_ms, probesize_bytes
         return {"status": "error"}
 
 # =========================
+# Bitrate fallback (active measurement)
+# =========================
+def measure_bitrate_active(url, sample_sec=2.5, max_bytes=2_000_000, connect_timeout=3, read_timeout=3, chunk_size=32 * 1024):
+    """
+    Opens the stream and reads for up to sample_sec or max_bytes, whichever occurs first,
+    and computes bitrate in kbps. This counts as a streaming connection, so call only
+    under the stream slot/semaphore.
+    """
+    headers = {"User-Agent": USER_AGENT}
+    start = time.monotonic()
+    bytes_read = 0
+    try:
+        with requests.get(url, headers=headers, stream=True, timeout=(connect_timeout, read_timeout)) as resp:
+            resp.raise_for_status()
+            for chunk in resp.iter_content(chunk_size=chunk_size):
+                if not chunk:
+                    continue
+                bytes_read += len(chunk)
+                now = time.monotonic()
+                if (now - start) >= sample_sec or bytes_read >= max_bytes:
+                    break
+        elapsed = max(0.001, time.monotonic() - start)
+        kbps = int(round((bytes_read * 8) / 1000.0 / elapsed))
+        return str(kbps) if kbps > 0 else "N/A"
+    except Exception as e:
+        debug_log(f"bitrate fallback error: {e}")
+        return "N/A"
+
+# =========================
 # Filtering
 # =========================
 def filter_streams(live_categories, live_streams, group, channel):
@@ -234,7 +235,6 @@ def filter_streams(live_categories, live_streams, group, channel):
     group_l = group.lower() if group else None
     channel_l = channel.lower() if channel else None
 
-    # Precompute category filter set if group provided
     allowed_cat_ids = None
     if group_l:
         allowed_cat_ids = {
@@ -243,9 +243,8 @@ def filter_streams(live_categories, live_streams, group, channel):
         }
 
     for s in live_streams:
-        if allowed_cat_ids is not None:
-            if s.get("category_id") not in allowed_cat_ids:
-                continue
+        if allowed_cat_ids is not None and s.get("category_id") not in allowed_cat_ids:
+            continue
         if channel_l and channel_l not in (s.get("name") or "").lower():
             continue
         filtered.append(s)
@@ -255,12 +254,6 @@ def filter_streams(live_categories, live_streams, group, channel):
 # Concurrency Management
 # =========================
 class StreamSlotManager:
-    """
-    Manages concurrently active STREAM probes (not API calls).
-    Uses a semaphore of size N.
-    Optionally holds a slot for `grace_hold` seconds after probe to account for
-    providers lingering sessions briefly.
-    """
     def __init__(self, max_slots: int, grace_hold: float):
         self.sem = threading.Semaphore(max_slots)
         self.grace_hold = max(0.0, float(grace_hold))
@@ -269,8 +262,6 @@ class StreamSlotManager:
         self.sem.acquire()
 
     def release(self):
-        # Hold the slot briefly to avoid immediate reuse while the provider still
-        # counts the session as open.
         if self.grace_hold > 0:
             time.sleep(self.grace_hold)
         self.sem.release()
@@ -302,23 +293,16 @@ def analyze_stream(
     user: str,
     pw: str,
 ):
-    """
-    Worker function to:
-    - optionally check EPG count
-    - probe stream with ffprobe under slot/semaphore control
-    """
     stream_id = stream["stream_id"]
     name = (stream.get("name") or "")[:60]
     category_name = (category_map.get(stream.get("category_id")) or "Unknown")[:40]
 
-    # EPG count via player_api (usually not a counted stream connection)
+    # EPG (API) – not a counted stream connection
     epg_count = ""
     if args.epgcheck:
-        # Small jitter to avoid bursty API calls
         time.sleep(random.uniform(0.05, 0.2))
         epg_count = check_epg(server, user, pw, stream_id)
 
-    # STREAM PROBE (counted)
     codec = ""
     width = ""
     height = ""
@@ -326,11 +310,9 @@ def analyze_stream(
     bitrate_kbps = ""
 
     if args.check:
-        # Randomized jitter before opening a stream to avoid stampeding patterns
-        time.sleep(random.uniform(0.3, 1.2))
+        time.sleep(random.uniform(0.3, 1.2))  # jitter before opening stream
         slot_mgr.acquire()
         try:
-            # Build URL and run ffprobe
             url = f"http://{server}/{user}/{pw}/{stream_id}"
             info = ffprobe_channel(
                 url=url,
@@ -352,20 +334,31 @@ def analyze_stream(
                 height = "N/A"
                 fps = "N/A"
                 bitrate_kbps = "N/A"
+
+            # Bitrate fallback if missing
+            if args.bitrate_fallback and (not bitrate_kbps or bitrate_kbps == "N/A"):
+                # small gap to reduce “lingering session” overlap
+                if args.bitrate_fallback_gap > 0:
+                    time.sleep(args.bitrate_fallback_gap)
+                bitrate_kbps = measure_bitrate_active(
+                    url=url,
+                    sample_sec=args.bitrate_fallback_sample_sec,
+                    max_bytes=args.bitrate_fallback_bytes
+                )
         finally:
             slot_mgr.release()
 
-    # Print line
     resolution = f"{width}x{height}" if args.check else ""
+    bitrate_str = f"{bitrate_kbps} kbps" if bitrate_kbps and bitrate_kbps != "N/A" else "N/A"
+
     with print_lock:
         progress = f"[{index}/{total}] "
         print(
             f"{progress}{str(stream_id):<8} {name:<60} {category_name:<40} "
             f"{str(stream.get('tv_archive_duration', 'N/A')):<8} {str(epg_count):<5} "
-            f"{str(codec):<8} {resolution:<15} {str(fps):<5} {str(bitrate_kbps):<8}kbps"
+            f"{str(codec):<8} {resolution:<15} {str(fps):<5} {bitrate_str:<12}"
         )
 
-    # Prepare CSV row
     return {
         "Stream ID": stream_id,
         "Name": name,
@@ -375,7 +368,7 @@ def analyze_stream(
         "Codec": codec,
         "Resolution": resolution,
         "Frame Rate": fps,
-        "Bitrate (kbps)": bitrate_kbps
+        "Bitrate (kbps)": bitrate_kbps if bitrate_kbps and bitrate_kbps != "N/A" else "N/A"
     }
 
 # =========================
@@ -413,18 +406,25 @@ def main():
 
     # ffprobe tuning
     parser.add_argument("--ffprobe-timeout", type=int, default=12, help="Overall ffprobe process timeout seconds (default: 12)")
-    parser.add_argument("--ffprobe-rw-timeout-ms", type=int, default=3000, help="I/O timeout for ffprobe AVIO (microseconds input), specify in ms (default: 3000)")
+    parser.add_argument("--ffprobe-rw-timeout-ms", type=int, default=3000, help="I/O timeout for ffprobe AVIO in ms (default: 3000)")
     parser.add_argument("--ffprobe-analyze-ms", type=int, default=700, help="Analyze duration in ms (default: 700)")
     parser.add_argument("--ffprobe-probesize", type=int, default=512_000, help="Probe size in bytes (default: 512000)")
     parser.add_argument("--ffprobe-reconnect", action="store_true", help="Enable ffprobe HTTP reconnect hints")
 
-    # Worker threads for scheduling tasks (not the same as stream concurrency)
+    # Worker threads
     parser.add_argument("--workers", type=int, default=4, help="Thread pool size to schedule probes (default: 4)")
+
+    # Bitrate fallback controls
+    parser.add_argument("--bitrate-fallback", dest="bitrate_fallback", action="store_true", help="Enable active bitrate fallback if ffprobe returns N/A (default ON)")
+    parser.add_argument("--no-bitrate-fallback", dest="bitrate_fallback", action="store_false", help="Disable bitrate fallback")
+    parser.set_defaults(bitrate_fallback=True)
+    parser.add_argument("--bitrate-fallback-sample-sec", type=float, default=2.5, help="Seconds to read bytes for bitrate fallback (default: 2.5)")
+    parser.add_argument("--bitrate-fallback-bytes", type=int, default=2_000_000, help="Max bytes to read during fallback (default: 2,000,000)")
+    parser.add_argument("--bitrate-fallback-gap", type=float, default=1.0, help="Seconds to wait after ffprobe before fallback to avoid overlap (default: 1.0)")
 
     args = parser.parse_args()
     DEBUG_MODE = args.debug
 
-    # Validate ffprobe when needed
     if args.check and not check_ffprobe_available():
         sys.exit(1)
 
@@ -435,6 +435,8 @@ def main():
     if args.check:
         debug_log(f"ffprobe: timeout={args.ffprobe_timeout}s, rw_timeout={args.ffprobe_rw_timeout_ms}ms, "
                   f"analyze={args.ffprobe_analyze_ms}ms, probesize={args.ffprobe_probesize} bytes, reconnect={args.ffprobe_reconnect}")
+        debug_log(f"bitrate fallback: enabled={args.bitrate_fallback}, sample={args.bitrate_fallback_sample_sec}s, "
+                  f"max_bytes={args.bitrate_fallback_bytes}, gap={args.bitrate_fallback_gap}s")
 
     # Fetch live categories and streams (cache per day)
     if not args.nocache:
@@ -450,23 +452,18 @@ def main():
         save_cache(args.server, "live_categories", live_categories)
         save_cache(args.server, "live_streams", live_streams)
 
-    # Build category map
     category_map = {c.get("category_id"): c.get("category_name", "") for c in live_categories}
-
-    # Filter streams
     filtered = filter_streams(live_categories, live_streams, args.category, args.channel)
     total = len(filtered)
 
-    # Header
     print("")
-    print(f"{'':<10}{'ID':<8} {'Name':<60} {'Category':<40} {'Arch':<8} {'EPG':<5} {'Codec':<8} {'Resolution':<15} {'FPS':<5} {'Bitrate':<10}")
+    print(f"{'':<10}{'ID':<8} {'Name':<60} {'Category':<40} {'Arch':<8} {'EPG':<5} {'Codec':<8} {'Resolution':<15} {'FPS':<5} {'Bitrate':<12}")
     print("=" * 170)
 
     if total == 0:
         print("No streams match the filter.")
         return
 
-    # Slot manager enforces STREAM connection cap
     slot_mgr = StreamSlotManager(max_slots=max(1, args.stream_concurrency), grace_hold=args.grace_hold)
 
     rows = []
@@ -492,11 +489,11 @@ def main():
             row = f.result()
             rows.append(row)
 
-    # Save CSV if requested
     if args.save:
         fieldnames = ["Stream ID", "Name", "Category", "Archive", "EPG", "Codec", "Resolution", "Frame Rate", "Bitrate (kbps)"]
-        # Keep CSV in original order of filtered streams
-        rows_sorted = sorted(rows, key=lambda r: filtered.index(next(s for s in filtered if s["stream_id"] == r["Stream ID"])))
+        # Preserve original filtered order
+        order = {s["stream_id"]: i for i, s in enumerate(filtered)}
+        rows_sorted = sorted(rows, key=lambda r: order.get(r["Stream ID"], 1_000_000))
         save_to_csv(args.save, rows_sorted, fieldnames)
 
     print("\nDone.\n")
